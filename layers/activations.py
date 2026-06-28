@@ -33,15 +33,20 @@ class Tanh(Activation):
 
 
 class GeLU(Activation):
-    """Gaussian Error Linear Unit — used in modern transformers."""
-    _SQRT2 = np.sqrt(2.0)
+    """Tanh-approximated GeLU (used by GPT-2).
+
+    GeLU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+    """
+    _C = np.sqrt(2.0 / np.pi)
 
     def forward(self, x: np.ndarray) -> np.ndarray:
-        from scipy.special import erf
         self._x = x
-        self._cdf = 0.5 * (1.0 + erf(x / self._SQRT2))
-        return x * self._cdf
+        self._inner = self._C * (x + 0.044715 * x ** 3)
+        self._tanh = np.tanh(self._inner)
+        return 0.5 * x * (1.0 + self._tanh)
 
     def backward(self, grad: np.ndarray) -> np.ndarray:
-        pdf = np.exp(-0.5 * self._x ** 2) / np.sqrt(2.0 * np.pi)
-        return grad * (self._cdf + self._x * pdf)
+        cdf = 0.5 * (1.0 + self._tanh)
+        d_tanh = 1.0 - self._tanh ** 2
+        d_inner = self._C * (1.0 + 3.0 * 0.044715 * self._x ** 2)
+        return grad * (cdf + self._x * 0.5 * d_tanh * d_inner)
