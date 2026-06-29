@@ -13,25 +13,14 @@ Usage:
     recon = vae.forward(x)
     recon_loss = MSELoss().forward(recon, x)
     total_loss = recon_loss + beta * vae.kl_loss()
-    recon_grad = MSELoss().backward()       # or recompute
+    recon_grad = MSELoss().backward()
     vae.backward(recon_grad, beta=beta)
     optimizer.step()
 """
 import numpy as np
 from core.module import Model
 from layers.linear import Linear
-from layers.activations import ReLU
-from models.sequential import Sequential
-
-
-def _build_mlp(dims: list[int], activation_cls=ReLU) -> Sequential:
-    """Linear → activation → … → Linear (no trailing activation)."""
-    layers = []
-    for i in range(len(dims) - 1):
-        layers.append(Linear(dims[i], dims[i + 1]))
-        if i < len(dims) - 2:
-            layers.append(activation_cls())
-    return Sequential(layers)
+from models.mlp import MLP
 
 
 class VAE(Model):
@@ -43,26 +32,20 @@ class VAE(Model):
         hidden_dims: list[int],
         latent_dim: int,
         decoder_hidden_dims: list[int] | None = None,
-        activation_cls=ReLU,
+        activation_cls=None,
     ):
+        from layers.activations import ReLU
+        activation_cls = activation_cls or ReLU
         dec_dims = decoder_hidden_dims if decoder_hidden_dims is not None else hidden_dims[::-1]
 
-        # encoder: input → last hidden dim
-        self.encoder = _build_mlp([input_dim] + hidden_dims, activation_cls)
+        self.encoder = MLP([input_dim] + hidden_dims, activation=activation_cls)
         self.mu_head = Linear(hidden_dims[-1], latent_dim)
         self.log_var_head = Linear(hidden_dims[-1], latent_dim)
+        self.decoder = MLP([latent_dim] + dec_dims + [input_dim], activation=activation_cls)
 
-        # decoder: latent → input reconstruction
-        self.decoder = _build_mlp([latent_dim] + dec_dims + [input_dim], activation_cls)
-
-        # cached values for backward
         self._mu: np.ndarray | None = None
         self._log_var: np.ndarray | None = None
         self._eps: np.ndarray | None = None
-
-    # ------------------------------------------------------------------
-    # Core interface
-    # ------------------------------------------------------------------
 
     def forward(self, x: np.ndarray) -> np.ndarray:
         h = self.encoder.forward(x)
@@ -77,26 +60,18 @@ class VAE(Model):
         grad_recon: dL_recon / d_reconstruction  (from your reconstruction loss)
         beta: weight on the KL term (β-VAE; use 1.0 for standard VAE)
         """
-        # --- decoder ---
         d_z = self.decoder.backward(grad_recon)
 
-        # --- reparameterization: z = mu + eps * std, std = exp(0.5 * log_var) ---
         std = np.exp(0.5 * self._log_var)
         d_mu = d_z.copy()
         d_log_var = d_z * self._eps * std * 0.5
 
-        # --- KL gradient: KL = -0.5 * mean(1 + log_var - mu² - exp(log_var)) ---
         n = self._mu.shape[0]
         d_mu += beta * self._mu / n
         d_log_var += beta * 0.5 * (np.exp(self._log_var) - 1.0) / n
 
-        # --- encoder heads ---
         d_h = self.mu_head.backward(d_mu) + self.log_var_head.backward(d_log_var)
         self.encoder.backward(d_h)
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
 
     def _reparameterize(self, mu: np.ndarray, log_var: np.ndarray) -> np.ndarray:
         self._eps = np.random.randn(*mu.shape)
@@ -118,8 +93,7 @@ class VAE(Model):
         """Generate n samples by decoding random latent vectors."""
         if latent_dim is None:
             latent_dim = self.mu_head.W.data.shape[1]
-        z = np.random.randn(n, latent_dim)
-        return self.decode(z)
+        return self.decode(np.random.randn(n, latent_dim))
 
     def parameters(self) -> list:
         return (

@@ -1,42 +1,8 @@
 import numpy as np
-from core.module import Model, Layer
-from core.parameter import Parameter
+from core.module import Model
 from layers.linear import Linear
 from layers.activations import ReLU
-
-
-class ResidualBlock(Layer):
-    """Two-layer residual block (MLP-style, no convolutions).
-
-    out = ReLU(x + Linear2(ReLU(Linear1(x))))
-    Requires in_features == out_features for the identity skip.
-    """
-
-    def __init__(self, features: int):
-        self.linear1 = Linear(features, features)
-        self.relu1 = ReLU()
-        self.linear2 = Linear(features, features)
-        self.relu2 = ReLU()
-
-    def forward(self, x: np.ndarray) -> np.ndarray:
-        self._skip = x
-        out = self.linear1.forward(x)
-        out = self.relu1.forward(out)
-        out = self.linear2.forward(out)
-        out = out + x                   # residual addition
-        self._pre_relu2 = out
-        return self.relu2.forward(out)
-
-    def backward(self, grad: np.ndarray) -> np.ndarray:
-        grad = self.relu2.backward(grad)
-        grad_skip = grad               # identity branch carries the same gradient
-        grad = self.linear2.backward(grad)
-        grad = self.relu1.backward(grad)
-        grad = self.linear1.backward(grad)
-        return grad + grad_skip
-
-    def parameters(self) -> list:
-        return self.linear1.parameters() + self.linear2.parameters()
+from layers.residual import ResidualBlock
 
 
 class ResNet(Model):
@@ -58,8 +24,7 @@ class ResNet(Model):
         self.output_proj = Linear(hidden_features, out_features)
 
     def forward(self, x: np.ndarray) -> np.ndarray:
-        x = self.input_proj.forward(x)
-        x = self.input_relu.forward(x)
+        x = self.input_relu.forward(self.input_proj.forward(x))
         for block in self.blocks:
             x = block.forward(x)
         return self.output_proj.forward(x)
@@ -68,11 +33,10 @@ class ResNet(Model):
         grad = self.output_proj.backward(grad)
         for block in reversed(self.blocks):
             grad = block.backward(grad)
-        grad = self.input_relu.backward(grad)
-        return self.input_proj.backward(grad)
+        return self.input_proj.backward(self.input_relu.backward(grad))
 
     def parameters(self) -> list:
-        params = self.input_proj.parameters() + self.input_relu.parameters()
+        params = self.input_proj.parameters()
         for block in self.blocks:
             params.extend(block.parameters())
         params.extend(self.output_proj.parameters())

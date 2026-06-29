@@ -14,35 +14,11 @@ Usage:
     token_ids = model.generate(prompt, max_new_tokens=50)
 """
 import numpy as np
-from core.module import Layer, Model
+from core.module import Model
 from layers.activations import GeLU
 from layers.normalization import LayerNorm
 from layers.embedding import Embedding, LearnedPositionalEmbedding
-from models.transformer import TransformerBlock
-
-
-class _TiedProjection(Layer):
-    """Output head that reuses the token embedding matrix (W_emb^T).
-
-    Gradient accumulates into the shared embedding Parameter so it is
-    updated by a single optimizer entry.
-    """
-
-    def __init__(self, embedding: Embedding):
-        self._W = embedding.W  # (vocab_size, d_model)
-
-    def forward(self, x: np.ndarray) -> np.ndarray:
-        self._x = x
-        return x @ self._W.data.T  # (B, T, vocab_size)
-
-    def backward(self, grad: np.ndarray) -> np.ndarray:
-        x_2d = self._x.reshape(-1, self._x.shape[-1])
-        grad_2d = grad.reshape(-1, grad.shape[-1])
-        self._W.grad += grad_2d.T @ x_2d          # (vocab_size, d_model)
-        return (grad_2d @ self._W.data).reshape(self._x.shape)
-
-    def parameters(self) -> list:
-        return []  # weight is owned by the Embedding; don't double-count
+from layers.attention import TransformerBlock, _TiedProjection
 
 
 class GPT2(Model):
@@ -69,11 +45,7 @@ class GPT2(Model):
             for _ in range(n_layers)
         ]
         self.norm = LayerNorm(d_model)
-        self.head = _TiedProjection(self.token_emb)  # shares token_emb.W
-
-    # ------------------------------------------------------------------
-    # Named configs matching the GPT-2 paper
-    # ------------------------------------------------------------------
+        self.head = _TiedProjection(self.token_emb)
 
     @classmethod
     def small(cls) -> "GPT2":
@@ -95,10 +67,6 @@ class GPT2(Model):
         """1.5 B parameter GPT-2 (XL)."""
         return cls(vocab_size=50257, d_model=1600, n_heads=25, n_layers=48)
 
-    # ------------------------------------------------------------------
-    # Forward / backward
-    # ------------------------------------------------------------------
-
     def forward(self, tokens: np.ndarray) -> np.ndarray:
         x = self.pos_emb.forward(self.token_emb.forward(tokens))
         for block in self.blocks:
@@ -119,12 +87,8 @@ class GPT2(Model):
         for block in self.blocks:
             params.extend(block.parameters())
         params.extend(self.norm.parameters())
-        # self.head shares token_emb.W — parameters() returns [] for it
+        # self.head shares token_emb.W — parameters() returns []
         return params
-
-    # ------------------------------------------------------------------
-    # Text generation
-    # ------------------------------------------------------------------
 
     def generate(
         self,
@@ -138,10 +102,10 @@ class GPT2(Model):
         prompt: int array of shape (1, T) or (T,)
         Returns the full sequence including the prompt.
         """
-        tokens = np.atleast_2d(prompt)  # (1, T)
+        tokens = np.atleast_2d(prompt)
         for _ in range(max_new_tokens):
-            logits = self.forward(tokens)          # (1, T, vocab_size)
-            next_logits = logits[0, -1] / temperature  # (vocab_size,)
+            logits = self.forward(tokens)
+            next_logits = logits[0, -1] / temperature
 
             if top_k is not None:
                 threshold = np.sort(next_logits)[-top_k]
