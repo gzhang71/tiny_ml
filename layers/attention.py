@@ -18,7 +18,13 @@ def _softmax_backward(grad: np.ndarray, s: np.ndarray) -> np.ndarray:
 
 
 class MultiHeadAttention(Layer):
-    """Scaled dot-product multi-head self-attention with optional causal mask."""
+    """Scaled dot-product multi-head self-attention with optional causal mask.
+
+    Supports a KV cache for autoregressive inference: `forward(x, use_cache=True)`
+    appends the new keys/values to the cache and attends over the full history,
+    so each decode step only needs the newest token(s) as input. The cache is
+    inference-only — `backward` assumes the last forward was uncached.
+    """
 
     def __init__(self, d_model: int, n_heads: int, causal: bool = True):
         assert d_model % n_heads == 0
@@ -30,6 +36,12 @@ class MultiHeadAttention(Layer):
         self.W_K = Linear(d_model, d_model)
         self.W_V = Linear(d_model, d_model)
         self.W_O = Linear(d_model, d_model)
+        self._cache_k: np.ndarray | None = None
+        self._cache_v: np.ndarray | None = None
+
+    def reset_cache(self) -> None:
+        self._cache_k = None
+        self._cache_v = None
 
     def _split_heads(self, x: np.ndarray) -> np.ndarray:
         B, T, _ = x.shape
@@ -39,17 +51,26 @@ class MultiHeadAttention(Layer):
         B, H, T, dk = x.shape
         return x.transpose(0, 2, 1, 3).reshape(B, T, H * dk)
 
-    def forward(self, x: np.ndarray) -> np.ndarray:
+    def forward(self, x: np.ndarray, use_cache: bool = False) -> np.ndarray:
         B, T, _ = x.shape
         Q = self._split_heads(self.W_Q.forward(x))
         K = self._split_heads(self.W_K.forward(x))
         V = self._split_heads(self.W_V.forward(x))
 
+        past = 0
+        if use_cache:
+            if self._cache_k is not None:
+                K = np.concatenate([self._cache_k, K], axis=2)
+                V = np.concatenate([self._cache_v, V], axis=2)
+            self._cache_k, self._cache_v = K, V
+            past = K.shape[2] - T
+
         scale = np.sqrt(self.d_k)
         scores = Q @ K.transpose(0, 1, 3, 2) / scale
 
         if self.causal:
-            mask = np.triu(np.ones((T, T), dtype=bool), k=1)
+            # query i sits at absolute position past + i; mask keys beyond it
+            mask = np.triu(np.ones((T, K.shape[2]), dtype=bool), k=1 + past)
             scores = np.where(mask, -1e9, scores)
             self._causal_mask = mask
 
@@ -99,8 +120,8 @@ class TransformerBlock(Layer):
         self.norm2 = LayerNorm(d_model)
         self.ffn = FeedForward(d_model, d_ff, activation_cls=activation_cls)
 
-    def forward(self, x: np.ndarray) -> np.ndarray:
-        x = x + self.attn.forward(self.norm1.forward(x))
+    def forward(self, x: np.ndarray, use_cache: bool = False) -> np.ndarray:
+        x = x + self.attn.forward(self.norm1.forward(x), use_cache=use_cache)
         x = x + self.ffn.forward(self.norm2.forward(x))
         return x
 
@@ -108,6 +129,9 @@ class TransformerBlock(Layer):
         grad = grad + self.norm2.backward(self.ffn.backward(grad))
         grad = grad + self.norm1.backward(self.attn.backward(grad))
         return grad
+
+    def reset_cache(self) -> None:
+        self.attn.reset_cache()
 
     def parameters(self) -> list:
         return (
@@ -156,8 +180,8 @@ class RelativePositionBias(Layer):
         )
         return (ret + np.where(is_small, rel, np.minimum(val_large, n - 1))).astype(int)
 
-    def forward(self, seq_q: int, seq_k: int) -> np.ndarray:
-        q_pos = np.arange(seq_q)[:, None]
+    def forward(self, seq_q: int, seq_k: int, q_offset: int = 0) -> np.ndarray:
+        q_pos = np.arange(q_offset, q_offset + seq_q)[:, None]
         k_pos = np.arange(seq_k)[None, :]
         self._buckets = self._bucket(q_pos - k_pos)
         return self.W.data[:, self._buckets]
@@ -180,6 +204,12 @@ class T5SelfAttention(Layer):
         self.W_V = Linear(d_model, d_model)
         self.W_O = Linear(d_model, d_model)
         self.rel_bias = RelativePositionBias(n_heads, n_buckets, bidirectional=not causal)
+        self._cache_k: np.ndarray | None = None
+        self._cache_v: np.ndarray | None = None
+
+    def reset_cache(self) -> None:
+        self._cache_k = None
+        self._cache_v = None
 
     def _split(self, x: np.ndarray) -> np.ndarray:
         B, T, _ = x.shape
@@ -189,18 +219,26 @@ class T5SelfAttention(Layer):
         B, H, T, dk = x.shape
         return x.transpose(0, 2, 1, 3).reshape(B, T, H * dk)
 
-    def forward(self, x: np.ndarray) -> np.ndarray:
+    def forward(self, x: np.ndarray, use_cache: bool = False) -> np.ndarray:
         B, T, _ = x.shape
         Q = self._split(self.W_Q.forward(x))
         K = self._split(self.W_K.forward(x))
         V = self._split(self.W_V.forward(x))
 
+        past = 0
+        if use_cache:
+            if self._cache_k is not None:
+                K = np.concatenate([self._cache_k, K], axis=2)
+                V = np.concatenate([self._cache_v, V], axis=2)
+            self._cache_k, self._cache_v = K, V
+            past = K.shape[2] - T
+
         scale = np.sqrt(self.d_k)
         scores = Q @ K.transpose(0, 1, 3, 2) / scale
-        scores = scores + self.rel_bias.forward(T, T)[None]
+        scores = scores + self.rel_bias.forward(T, K.shape[2], q_offset=past)[None]
 
         if self.causal:
-            mask = np.triu(np.ones((T, T), dtype=bool), k=1)
+            mask = np.triu(np.ones((T, K.shape[2]), dtype=bool), k=1 + past)
             scores = np.where(mask, -1e9, scores)
             self._causal_mask = mask
 
@@ -238,7 +276,12 @@ class T5SelfAttention(Layer):
 
 
 class CrossAttention(Layer):
-    """Multi-head cross-attention: Q ← decoder, K/V ← encoder."""
+    """Multi-head cross-attention: Q ← decoder, K/V ← encoder.
+
+    With `use_cache=True` the encoder K/V are computed on the first call and
+    reused on every subsequent decode step (the encoder output never changes
+    during generation). Inference-only, like the self-attention KV cache.
+    """
 
     def __init__(self, d_model: int, n_heads: int):
         assert d_model % n_heads == 0
@@ -248,6 +291,12 @@ class CrossAttention(Layer):
         self.W_K = Linear(d_model, d_model)
         self.W_V = Linear(d_model, d_model)
         self.W_O = Linear(d_model, d_model)
+        self._cache_k: np.ndarray | None = None
+        self._cache_v: np.ndarray | None = None
+
+    def reset_cache(self) -> None:
+        self._cache_k = None
+        self._cache_v = None
 
     def _split(self, x: np.ndarray) -> np.ndarray:
         B, T, _ = x.shape
@@ -257,11 +306,16 @@ class CrossAttention(Layer):
         B, H, T, dk = x.shape
         return x.transpose(0, 2, 1, 3).reshape(B, T, H * dk)
 
-    def forward(self, x_dec: np.ndarray, x_enc: np.ndarray) -> np.ndarray:
+    def forward(self, x_dec: np.ndarray, x_enc: np.ndarray, use_cache: bool = False) -> np.ndarray:
         scale = np.sqrt(self.d_k)
         Q = self._split(self.W_Q.forward(x_dec))
-        K = self._split(self.W_K.forward(x_enc))
-        V = self._split(self.W_V.forward(x_enc))
+        if use_cache and self._cache_k is not None:
+            K, V = self._cache_k, self._cache_v
+        else:
+            K = self._split(self.W_K.forward(x_enc))
+            V = self._split(self.W_V.forward(x_enc))
+            if use_cache:
+                self._cache_k, self._cache_v = K, V
 
         attn = _softmax(Q @ K.transpose(0, 1, 3, 2) / scale)
         self._Q, self._K, self._V, self._attn, self._scale = Q, K, V, attn, scale

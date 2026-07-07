@@ -59,11 +59,15 @@ class T5DecoderBlock(Layer):
         self.norm3 = LayerNorm(d_model)
         self.ffn = FeedForward(d_model, d_ff)
 
-    def forward(self, x: np.ndarray, enc_out: np.ndarray) -> np.ndarray:
-        x = x + self.self_attn.forward(self.norm1.forward(x))
-        x = x + self.cross_attn.forward(self.norm2.forward(x), enc_out)
+    def forward(self, x: np.ndarray, enc_out: np.ndarray, use_cache: bool = False) -> np.ndarray:
+        x = x + self.self_attn.forward(self.norm1.forward(x), use_cache=use_cache)
+        x = x + self.cross_attn.forward(self.norm2.forward(x), enc_out, use_cache=use_cache)
         x = x + self.ffn.forward(self.norm3.forward(x))
         return x
+
+    def reset_cache(self) -> None:
+        self.self_attn.reset_cache()
+        self.cross_attn.reset_cache()
 
     def backward(self, grad: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Returns (d_x, d_enc_out)."""
@@ -140,12 +144,16 @@ class T5(Model):
             x = block.forward(x)
         return self.encoder_norm.forward(x)
 
-    def decode(self, tgt_tokens: np.ndarray, enc_out: np.ndarray) -> np.ndarray:
+    def decode(self, tgt_tokens: np.ndarray, enc_out: np.ndarray, use_cache: bool = False) -> np.ndarray:
         x = self.shared_emb.forward(tgt_tokens)
         for block in self.decoder_blocks:
-            x = block.forward(x, enc_out)
+            x = block.forward(x, enc_out, use_cache=use_cache)
         x = self.decoder_norm.forward(x)
         return self.head.forward(x)
+
+    def reset_cache(self) -> None:
+        for block in self.decoder_blocks:
+            block.reset_cache()
 
     def forward(self, src_tokens: np.ndarray, tgt_tokens: np.ndarray) -> np.ndarray:
         self._src_tokens = src_tokens
@@ -167,6 +175,49 @@ class T5(Model):
         for block in reversed(self.encoder_blocks):
             grad_enc = block.backward(grad_enc)
         np.add.at(self.shared_emb.W.grad, self._src_tokens, grad_enc)
+
+    def generate(
+        self,
+        src_tokens: np.ndarray,
+        max_new_tokens: int = 50,
+        start_token: int = 0,
+        eos_token: int | None = None,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+    ) -> np.ndarray:
+        """Autoregressive decoding with KV caches.
+
+        The encoder runs once; its K/V are cached inside each cross-attention.
+        Decoder self-attention caches grow one token per step, so each step
+        feeds only the newest token.
+
+        src_tokens: int array of shape (1, T_src) or (T_src,)
+        Returns the generated target sequence (start token excluded).
+        """
+        src = np.atleast_2d(src_tokens)
+        self.reset_cache()
+        enc_out = self.encode(src)
+
+        token = np.array([[start_token]])
+        generated: list[int] = []
+        for _ in range(max_new_tokens):
+            logits = self.decode(token, enc_out, use_cache=True)
+            next_logits = logits[0, -1] / temperature
+
+            if top_k is not None:
+                threshold = np.sort(next_logits)[-top_k]
+                next_logits = np.where(next_logits >= threshold, next_logits, -1e9)
+
+            probs = np.exp(next_logits - next_logits.max())
+            probs /= probs.sum()
+            next_token = int(np.random.choice(len(probs), p=probs))
+            if eos_token is not None and next_token == eos_token:
+                break
+            generated.append(next_token)
+            token = np.array([[next_token]])
+
+        self.reset_cache()
+        return np.array(generated)
 
     def parameters(self) -> list:
         params = self.shared_emb.parameters()

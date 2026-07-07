@@ -46,6 +46,7 @@ class GPT2(Model):
         ]
         self.norm = LayerNorm(d_model)
         self.head = _TiedProjection(self.token_emb)
+        self._cache_len = 0  # tokens already in the KV cache
 
     @classmethod
     def small(cls) -> "GPT2":
@@ -67,12 +68,20 @@ class GPT2(Model):
         """1.5 B parameter GPT-2 (XL)."""
         return cls(vocab_size=50257, d_model=1600, n_heads=25, n_layers=48)
 
-    def forward(self, tokens: np.ndarray) -> np.ndarray:
-        x = self.pos_emb.forward(self.token_emb.forward(tokens))
+    def forward(self, tokens: np.ndarray, use_cache: bool = False) -> np.ndarray:
+        offset = self._cache_len if use_cache else 0
+        x = self.pos_emb.forward(self.token_emb.forward(tokens), offset=offset)
         for block in self.blocks:
-            x = block.forward(x)
+            x = block.forward(x, use_cache=use_cache)
+        if use_cache:
+            self._cache_len += tokens.shape[1]
         x = self.norm.forward(x)
         return self.head.forward(x)
+
+    def reset_cache(self) -> None:
+        for block in self.blocks:
+            block.reset_cache()
+        self._cache_len = 0
 
     def backward(self, grad: np.ndarray) -> None:
         grad = self.head.backward(grad)
@@ -97,14 +106,19 @@ class GPT2(Model):
         temperature: float = 1.0,
         top_k: int | None = None,
     ) -> np.ndarray:
-        """Autoregressive token generation.
+        """Autoregressive token generation with a KV cache.
+
+        Prefill: one parallel pass over the prompt fills the cache.
+        Decode: each subsequent pass feeds only the newest token.
 
         prompt: int array of shape (1, T) or (T,)
         Returns the full sequence including the prompt.
         """
         tokens = np.atleast_2d(prompt)
+        self.reset_cache()
+        logits = self.forward(tokens, use_cache=True)  # prefill
+
         for _ in range(max_new_tokens):
-            logits = self.forward(tokens)
             next_logits = logits[0, -1] / temperature
 
             if top_k is not None:
@@ -115,5 +129,7 @@ class GPT2(Model):
             probs /= probs.sum()
             next_token = np.random.choice(len(probs), p=probs)
             tokens = np.concatenate([tokens, [[next_token]]], axis=1)
+            logits = self.forward(np.array([[next_token]]), use_cache=True)  # decode step
 
+        self.reset_cache()
         return tokens[0]

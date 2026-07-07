@@ -36,9 +36,9 @@ class SinusoidalPositionalEmbedding(Layer):
         pe[:, 1::2] = np.cos(pos * div)
         self._pe = pe[None]  # (1, max_seq_len, d_model)
 
-    def forward(self, x: np.ndarray) -> np.ndarray:
+    def forward(self, x: np.ndarray, offset: int = 0) -> np.ndarray:
         T = x.shape[1]
-        return x + self._pe[:, :T]
+        return x + self._pe[:, offset:offset + T]
 
     def backward(self, grad: np.ndarray) -> np.ndarray:
         return grad  # PE is constant; gradient passes through unchanged
@@ -58,13 +58,15 @@ class LearnedPositionalEmbedding(Layer):
     def __init__(self, max_seq_len: int, d_model: int):
         self.W = Parameter(np.random.randn(max_seq_len, d_model) * 0.02)
         self._T: int = 0
+        self._offset: int = 0
 
-    def forward(self, x: np.ndarray) -> np.ndarray:
+    def forward(self, x: np.ndarray, offset: int = 0) -> np.ndarray:
         self._T = x.shape[1]
-        return x + self.W.data[: self._T]
+        self._offset = offset
+        return x + self.W.data[offset: offset + self._T]
 
     def backward(self, grad: np.ndarray) -> np.ndarray:
-        self.W.grad[: self._T] += grad.sum(axis=0)  # sum over batch
+        self.W.grad[self._offset: self._offset + self._T] += grad.sum(axis=0)  # sum over batch
         return grad  # identity for the residual path
 
 

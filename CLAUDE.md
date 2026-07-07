@@ -49,6 +49,7 @@ Each layer stores the inputs it needs for backward in `self._<name>` during `for
 - **`TransformerBlock` backward order** — the residual connection means grad flows through both the sublayer and the identity path: `grad = grad + norm.backward(sublayer.backward(grad))`.
 - **Softmax** is implemented as module-level functions (`_softmax`, `_softmax_backward`) in `layers/attention.py` rather than a `Layer` because it is always inlined inside attention with a causal mask and scale that attention owns.
 - **`VAE`** uses `MLP` for encoder/decoder (not a private `_build_mlp` helper).
+- **KV cache (inference-only)** — attention layers take `forward(x, use_cache=True)`: self-attention appends new K/V to `_cache_k`/`_cache_v` and masks with a `past`-offset causal mask; `CrossAttention` computes encoder K/V once and reuses them. Positional embeddings take an `offset` so decode-step tokens get their absolute position; models track it in `_cache_len`. `generate()` prefills on the prompt then decodes one token per step; `reset_cache()` clears everything. `backward` assumes the last forward was uncached — never train with `use_cache=True`.
 
 ### Directory layout
 
