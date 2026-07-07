@@ -26,6 +26,7 @@ if BACKEND == "jax":
     from jax import config as _jax_config
     _jax_config.update("jax_enable_x64", os.environ.get("TINY_ML_JAX_X64", "1") != "0")
     import jax.numpy as xp
+    from jax import lax as _lax
 else:
     BACKEND = "numpy"
     xp = _np
@@ -43,6 +44,33 @@ def scatter_add(arr, index, updates):
         # asarray: tolerate plain-numpy targets (e.g. user-zeroed grads)
         return xp.asarray(arr).at[index].add(updates)
     _np.add.at(arr, index, updates)
+    return arr
+
+
+def take_slice(arr, start, size, axis=0):
+    """`arr[..., start:start+size, ...]` along `axis`.
+
+    In jax mode this lowers to `lax.dynamic_slice` with a *runtime* start
+    index; a plain `arr[start:...]` bakes the offset into the compiled op, so
+    a start that changes every decode step would trigger a recompile per step.
+    """
+    if BACKEND == "jax":
+        return _lax.dynamic_slice_in_dim(arr, start, size, axis)
+    idx = [slice(None)] * arr.ndim
+    idx[axis] = slice(start, start + size)
+    return arr[tuple(idx)]
+
+
+def write_slice(arr, update, start, axis=0):
+    """`arr[..., start:start+len, ...] = update` along `axis`, returning the
+    result — always assign it back. Runtime start index for the same reason
+    as `take_slice`; numpy mutates in place.
+    """
+    if BACKEND == "jax":
+        return _lax.dynamic_update_slice_in_dim(arr, update, start, axis)
+    idx = [slice(None)] * arr.ndim
+    idx[axis] = slice(start, start + update.shape[axis])
+    arr[tuple(idx)] = update
     return arr
 
 

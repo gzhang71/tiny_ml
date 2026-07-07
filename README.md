@@ -70,8 +70,10 @@ TINY_ML_BACKEND=jax python -m tiny_ml.examples.gpt2      # float64, matches nump
 TINY_ML_BACKEND=jax TINY_ML_JAX_X64=0 python -m tiny_ml.examples.gpt2  # float32, fastest
 ```
 
-With the same seed, jax float64 mode reproduces numpy results bit-for-bit. Rough numbers on
-an Apple-silicon CPU for a GPT-2-style model (d_model=512, 6 layers, batch 8, seq 256):
+With the same seed, jax float64 mode reproduces numpy results (bit-for-bit for GPT-2 /
+Transformer; T5 drifts in the last bits because scatter-add accumulation order differs).
+Rough numbers on an Apple-silicon CPU for a GPT-2-style model (d_model=512, 6 layers,
+batch 8, seq 256):
 
 | backend        | train step |
 |----------------|-----------:|
@@ -80,9 +82,10 @@ an Apple-silicon CPU for a GPT-2-style model (d_model=512, 6 layers, batch 8, se
 | jax (float32)  |    0.65 s  |
 
 Use JAX mode for **training and batched forward passes**, and bigger wins are expected on
-GPU/TPU. Token-by-token `generate()` is *slower* under JAX (per-op dispatch overhead, plus
-XLA recompiles ops as the KV cache grows one token per step) — stick with numpy for
-generation.
+GPU/TPU. `generate()` uses a **static KV cache** (preallocated at `max_seq_len`) so array
+shapes never change between decode steps — without it, XLA would recompile every op for
+every new sequence length, which made generation ~50x slower. Small models still decode
+somewhat faster on numpy, since eager JAX pays per-op dispatch overhead on every step.
 
 ## Dependencies
 

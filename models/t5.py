@@ -51,9 +51,11 @@ class T5EncoderBlock(Layer):
 class T5DecoderBlock(Layer):
     """Pre-norm with three sub-layers: causal self-attn, cross-attn, FFN."""
 
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, n_buckets: int = 32):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, n_buckets: int = 32,
+                 max_cache_len: int = 512):
         self.norm1 = LayerNorm(d_model)
-        self.self_attn = T5SelfAttention(d_model, n_heads, causal=True, n_buckets=n_buckets)
+        self.self_attn = T5SelfAttention(d_model, n_heads, causal=True, n_buckets=n_buckets,
+                                         max_cache_len=max_cache_len)
         self.norm2 = LayerNorm(d_model)
         self.cross_attn = CrossAttention(d_model, n_heads)
         self.norm3 = LayerNorm(d_model)
@@ -101,6 +103,7 @@ class T5(Model):
         n_decoder_layers: int,
         d_ff: int | None = None,
         n_buckets: int = 32,
+        max_seq_len: int = 512,
     ):
         d_ff = d_ff or 4 * d_model
         self.shared_emb = Embedding(vocab_size, d_model)
@@ -110,7 +113,7 @@ class T5(Model):
         ]
         self.encoder_norm = LayerNorm(d_model)
         self.decoder_blocks = [
-            T5DecoderBlock(d_model, n_heads, d_ff, n_buckets)
+            T5DecoderBlock(d_model, n_heads, d_ff, n_buckets, max_cache_len=max_seq_len)
             for _ in range(n_decoder_layers)
         ]
         self.decoder_norm = LayerNorm(d_model)

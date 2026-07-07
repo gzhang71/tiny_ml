@@ -1,4 +1,4 @@
-from core.backend import xp as np, scatter_add
+from core.backend import BACKEND, xp as np, scatter_add, write_slice
 from core.module import Layer
 from core.parameter import Parameter
 from layers.linear import Linear
@@ -21,27 +21,34 @@ class MultiHeadAttention(Layer):
     """Scaled dot-product multi-head self-attention with optional causal mask.
 
     Supports a KV cache for autoregressive inference: `forward(x, use_cache=True)`
-    appends the new keys/values to the cache and attends over the full history,
-    so each decode step only needs the newest token(s) as input. The cache is
-    inference-only — `backward` assumes the last forward was uncached.
+    writes the new keys/values into a preallocated cache and attends over the
+    history, so each decode step only needs the newest token(s) as input. The
+    cache is *static* — allocated once at `max_cache_len` so every decode step
+    has identical array shapes (in jax mode a growing cache would recompile
+    every op at every step). Inference-only — `backward` assumes the last
+    forward was uncached.
     """
 
-    def __init__(self, d_model: int, n_heads: int, causal: bool = True):
+    def __init__(self, d_model: int, n_heads: int, causal: bool = True,
+                 max_cache_len: int = 512):
         assert d_model % n_heads == 0
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_k = d_model // n_heads
         self.causal = causal
+        self.max_cache_len = max_cache_len
         self.W_Q = Linear(d_model, d_model)
         self.W_K = Linear(d_model, d_model)
         self.W_V = Linear(d_model, d_model)
         self.W_O = Linear(d_model, d_model)
         self._cache_k: np.ndarray | None = None
         self._cache_v: np.ndarray | None = None
+        self._cache_len = 0
 
     def reset_cache(self) -> None:
         self._cache_k = None
         self._cache_v = None
+        self._cache_len = 0
 
     def _split_heads(self, x: np.ndarray) -> np.ndarray:
         B, T, _ = x.shape
@@ -57,26 +64,50 @@ class MultiHeadAttention(Layer):
         K = self._split_heads(self.W_K.forward(x))
         V = self._split_heads(self.W_V.forward(x))
 
-        past = 0
         if use_cache:
-            if self._cache_k is not None:
-                K = np.concatenate([self._cache_k, K], axis=2)
-                V = np.concatenate([self._cache_v, V], axis=2)
-            self._cache_k, self._cache_v = K, V
-            past = K.shape[2] - T
+            return self._forward_cached(Q, K, V, B, T)
 
         scale = np.sqrt(self.d_k)
         scores = Q @ K.transpose(0, 1, 3, 2) / scale
 
         if self.causal:
-            # query i sits at absolute position past + i; mask keys beyond it
-            mask = np.triu(np.ones((T, K.shape[2]), dtype=bool), k=1 + past)
+            mask = np.triu(np.ones((T, T), dtype=bool), k=1)
             scores = np.where(mask, -1e9, scores)
             self._causal_mask = mask
 
         attn = _softmax(scores)
         self._Q, self._K, self._V, self._attn, self._scale = Q, K, V, attn, scale
         return self.W_O.forward(self._merge_heads(attn @ V))
+
+    def _forward_cached(self, Q, K_new, V_new, B: int, T: int) -> np.ndarray:
+        past = self._cache_len
+        assert past + T <= self.max_cache_len, (
+            f"KV cache overflow ({past + T} > {self.max_cache_len}); "
+            "raise max_cache_len / max_seq_len"
+        )
+        if self._cache_k is None:
+            shape = (B, self.n_heads, self.max_cache_len, self.d_k)
+            self._cache_k = np.zeros(shape, dtype=K_new.dtype)
+            self._cache_v = np.zeros(shape, dtype=V_new.dtype)
+        self._cache_k = write_slice(self._cache_k, K_new, past, axis=2)
+        self._cache_v = write_slice(self._cache_v, V_new, past, axis=2)
+        self._cache_len = past + T
+
+        if BACKEND == "jax":
+            # attend over the full padded cache: constant shapes, no recompile
+            K, V = self._cache_k, self._cache_v
+        else:
+            # numpy has no compile cache to protect; skip the padded slots
+            K = self._cache_k[:, :, : past + T]
+            V = self._cache_v[:, :, : past + T]
+
+        scores = Q @ K.transpose(0, 1, 3, 2) / np.sqrt(self.d_k)
+        # query i sits at absolute position past + i; mask keys beyond it
+        # (this also hides the not-yet-written padded slots)
+        q_pos = past + np.arange(T)
+        mask = np.arange(K.shape[2])[None, :] > q_pos[:, None]
+        scores = np.where(mask, -1e9, scores)
+        return self.W_O.forward(self._merge_heads(_softmax(scores) @ V))
 
     def backward(self, grad: np.ndarray) -> np.ndarray:
         d_out = self._split_heads(self.W_O.backward(grad))
@@ -114,9 +145,11 @@ class TransformerBlock(Layer):
         d_ff: int | None = None,
         causal: bool = True,
         activation_cls=None,
+        max_cache_len: int = 512,
     ):
         self.norm1 = LayerNorm(d_model)
-        self.attn = MultiHeadAttention(d_model, n_heads, causal=causal)
+        self.attn = MultiHeadAttention(d_model, n_heads, causal=causal,
+                                       max_cache_len=max_cache_len)
         self.norm2 = LayerNorm(d_model)
         self.ffn = FeedForward(d_model, d_ff, activation_cls=activation_cls)
 
@@ -192,13 +225,19 @@ class RelativePositionBias(Layer):
 
 
 class T5SelfAttention(Layer):
-    """Multi-head self-attention with relative position bias."""
+    """Multi-head self-attention with relative position bias.
 
-    def __init__(self, d_model: int, n_heads: int, causal: bool, n_buckets: int = 32):
+    KV cache works exactly like `MultiHeadAttention`'s: static preallocation
+    at `max_cache_len` so jax decode steps never change shape.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, causal: bool, n_buckets: int = 32,
+                 max_cache_len: int = 512):
         assert d_model % n_heads == 0
         self.n_heads = n_heads
         self.d_k = d_model // n_heads
         self.causal = causal
+        self.max_cache_len = max_cache_len
         self.W_Q = Linear(d_model, d_model)
         self.W_K = Linear(d_model, d_model)
         self.W_V = Linear(d_model, d_model)
@@ -206,10 +245,12 @@ class T5SelfAttention(Layer):
         self.rel_bias = RelativePositionBias(n_heads, n_buckets, bidirectional=not causal)
         self._cache_k: np.ndarray | None = None
         self._cache_v: np.ndarray | None = None
+        self._cache_len = 0
 
     def reset_cache(self) -> None:
         self._cache_k = None
         self._cache_v = None
+        self._cache_len = 0
 
     def _split(self, x: np.ndarray) -> np.ndarray:
         B, T, _ = x.shape
@@ -225,26 +266,48 @@ class T5SelfAttention(Layer):
         K = self._split(self.W_K.forward(x))
         V = self._split(self.W_V.forward(x))
 
-        past = 0
         if use_cache:
-            if self._cache_k is not None:
-                K = np.concatenate([self._cache_k, K], axis=2)
-                V = np.concatenate([self._cache_v, V], axis=2)
-            self._cache_k, self._cache_v = K, V
-            past = K.shape[2] - T
+            return self._forward_cached(Q, K, V, B, T)
 
         scale = np.sqrt(self.d_k)
         scores = Q @ K.transpose(0, 1, 3, 2) / scale
-        scores = scores + self.rel_bias.forward(T, K.shape[2], q_offset=past)[None]
+        scores = scores + self.rel_bias.forward(T, T)[None]
 
         if self.causal:
-            mask = np.triu(np.ones((T, K.shape[2]), dtype=bool), k=1 + past)
+            mask = np.triu(np.ones((T, T), dtype=bool), k=1)
             scores = np.where(mask, -1e9, scores)
             self._causal_mask = mask
 
         attn = _softmax(scores)
         self._Q, self._K, self._V, self._attn, self._scale = Q, K, V, attn, scale
         return self.W_O.forward(self._merge(attn @ V))
+
+    def _forward_cached(self, Q, K_new, V_new, B: int, T: int) -> np.ndarray:
+        past = self._cache_len
+        assert past + T <= self.max_cache_len, (
+            f"KV cache overflow ({past + T} > {self.max_cache_len}); "
+            "raise max_cache_len / max_seq_len"
+        )
+        if self._cache_k is None:
+            shape = (B, self.n_heads, self.max_cache_len, self.d_k)
+            self._cache_k = np.zeros(shape, dtype=K_new.dtype)
+            self._cache_v = np.zeros(shape, dtype=V_new.dtype)
+        self._cache_k = write_slice(self._cache_k, K_new, past, axis=2)
+        self._cache_v = write_slice(self._cache_v, V_new, past, axis=2)
+        self._cache_len = past + T
+
+        if BACKEND == "jax":
+            K, V = self._cache_k, self._cache_v
+        else:
+            K = self._cache_k[:, :, : past + T]
+            V = self._cache_v[:, :, : past + T]
+
+        scores = Q @ K.transpose(0, 1, 3, 2) / np.sqrt(self.d_k)
+        scores = scores + self.rel_bias.forward(T, K.shape[2], q_offset=past)[None]
+        q_pos = past + np.arange(T)
+        mask = np.arange(K.shape[2])[None, :] > q_pos[:, None]
+        scores = np.where(mask, -1e9, scores)
+        return self.W_O.forward(self._merge(_softmax(scores) @ V))
 
     def backward(self, grad: np.ndarray) -> np.ndarray:
         d_out = self._split(self.W_O.backward(grad))

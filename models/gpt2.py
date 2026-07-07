@@ -41,7 +41,8 @@ class GPT2(Model):
         self.token_emb = Embedding(vocab_size, d_model)
         self.pos_emb = LearnedPositionalEmbedding(max_seq_len, d_model)
         self.blocks = [
-            TransformerBlock(d_model, n_heads, d_ff, causal=True, activation_cls=GeLU)
+            TransformerBlock(d_model, n_heads, d_ff, causal=True, activation_cls=GeLU,
+                             max_cache_len=max_seq_len)
             for _ in range(n_layers)
         ]
         self.norm = LayerNorm(d_model)
@@ -114,10 +115,11 @@ class GPT2(Model):
         prompt: int array of shape (1, T) or (T,)
         Returns the full sequence including the prompt.
         """
-        tokens = np.atleast_2d(prompt)
+        prompt = np.atleast_2d(prompt)
         self.reset_cache()
-        logits = self.forward(tokens, use_cache=True)  # prefill
+        logits = self.forward(prompt, use_cache=True)  # prefill
 
+        generated: list[int] = []
         for _ in range(max_new_tokens):
             next_logits = logits[0, -1] / temperature
 
@@ -127,8 +129,8 @@ class GPT2(Model):
 
             probs = np.exp(next_logits - next_logits.max())
             next_token = sample_categorical(probs)
-            tokens = np.concatenate([tokens, np.array([[next_token]])], axis=1)
+            generated.append(next_token)
             logits = self.forward(np.array([[next_token]]), use_cache=True)  # decode step
 
         self.reset_cache()
-        return tokens[0]
+        return np.concatenate([prompt[0], np.array(generated)])

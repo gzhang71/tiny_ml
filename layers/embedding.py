@@ -1,4 +1,4 @@
-from core.backend import xp as np, randn, scatter_add
+from core.backend import xp as np, randn, scatter_add, take_slice
 from core.module import Layer
 from core.parameter import Parameter
 
@@ -37,7 +37,9 @@ class SinusoidalPositionalEmbedding(Layer):
 
     def forward(self, x: np.ndarray, offset: int = 0) -> np.ndarray:
         T = x.shape[1]
-        return x + self._pe[:, offset:offset + T]
+        # take_slice: offset changes every decode step; a baked-in slice would
+        # recompile per step in jax mode
+        return x + take_slice(self._pe, offset, T, axis=1)
 
     def backward(self, grad: np.ndarray) -> np.ndarray:
         return grad  # PE is constant; gradient passes through unchanged
@@ -62,7 +64,7 @@ class LearnedPositionalEmbedding(Layer):
     def forward(self, x: np.ndarray, offset: int = 0) -> np.ndarray:
         self._T = x.shape[1]
         self._offset = offset
-        return x + self.W.data[offset: offset + self._T]
+        return x + take_slice(self.W.data, offset, self._T, axis=0)
 
     def backward(self, grad: np.ndarray) -> np.ndarray:
         self.W.grad = scatter_add(
