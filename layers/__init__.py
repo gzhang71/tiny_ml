@@ -20,3 +20,4 @@ from layers.attention import (
     CrossAttention,
 )
 from layers.flash_attention import FlashAttention, FlashAttention2
+from layers.heads import Head, LinearHead, EuclideanHead, CosineHead, HyperbolicHead
