@@ -20,7 +20,9 @@ import numpy as onp  # bookkeeping only
 from models.gpt2 import GPT2
 from layers.moe import MoEFeedForward
 from losses.losses import SoftmaxCrossEntropy
-from optim.adam import ADAM
+from optim.adamw import AdamW, decay_groups
+from optim.clip import clip_grad_norm
+from optim.schedule import CosineWithWarmup
 
 SEQ_LEN = 128
 BATCH = 8
@@ -31,6 +33,9 @@ TOP_K = 2
 STEPS = int(os.environ.get("TRAIN_STEPS", 150))
 AUX_COEF = float(os.environ.get("AUX_COEF", 0.01))  # 0 → routers collapse onto 1-2 experts
 LOG_EVERY = 5
+WARMUP_STEPS = max(1, STEPS // 20)
+MAX_GRAD_NORM = 1.0
+VAL_FRACTION = 0.05
 
 
 def load_corpus() -> onp.ndarray:
@@ -42,8 +47,15 @@ def load_corpus() -> onp.ndarray:
     return onp.frombuffer(text.encode("utf-8"), dtype=onp.uint8)
 
 
-def make_batch(data: onp.ndarray):
-    starts = onp.random.randint(0, len(data) - SEQ_LEN - 1, size=BATCH)
+def split_corpus(data: onp.ndarray) -> tuple[onp.ndarray, onp.ndarray]:
+    """Hold out a contiguous tail for validation (see examples/train_100m.py)."""
+    split = int(len(data) * (1.0 - VAL_FRACTION))
+    return data[:split], data[split:]
+
+
+def make_batch(data: onp.ndarray, rng: onp.random.RandomState | None = None):
+    draw = rng if rng is not None else onp.random
+    starts = draw.randint(0, len(data) - SEQ_LEN - 1, size=BATCH)
     x = onp.stack([data[s: s + SEQ_LEN] for s in starts]).astype(onp.int64)
     y = onp.stack([data[s + 1: s + SEQ_LEN + 1] for s in starts]).astype(onp.int64)
     return x, y
@@ -53,10 +65,23 @@ def n_params(module) -> int:
     return sum(int(onp.prod(p.data.shape)) for p in module.parameters())
 
 
+def estimate_val_loss(model, loss_fn, val_data, batches: int = 5) -> float:
+    """Mean loss over a few fixed validation batches (same batches every call)."""
+    rng = onp.random.RandomState(1234)
+    model.eval()
+    total = 0.0
+    for _ in range(batches):
+        x, y = make_batch(val_data, rng)
+        logits = model.forward(x)
+        total += float(loss_fn.forward(logits.reshape(-1, 256), y.reshape(-1)))
+    model.train()
+    return total / batches
+
+
 def main():
     onp.random.seed(0)
-    data = load_corpus()
-    print(f"Corpus: {len(data):,} bytes")
+    train_data, val_data = split_corpus(load_corpus())
+    print(f"Corpus: {len(train_data):,} train / {len(val_data):,} val bytes")
 
     model = GPT2(vocab_size=256, d_model=D_MODEL, n_heads=12, n_layers=N_LAYERS,
                  max_seq_len=256)
@@ -72,21 +97,33 @@ def main():
           f"({N_EXPERTS} experts, top-{TOP_K}, {N_LAYERS} layers)")
 
     loss_fn = SoftmaxCrossEntropy()
-    optimizer = ADAM(model.parameters(), lr=3e-4)
+    params = model.parameters()
+    _, no_decay = decay_groups(model)
+    optimizer = AdamW(params, lr=3e-4, weight_decay=0.1, no_decay=no_decay)
+    schedule = CosineWithWarmup(peak_lr=3e-4, warmup_steps=WARMUP_STEPS,
+                                total_steps=STEPS, min_lr=3e-5)
 
     t0 = time.time()
     for step in range(1, STEPS + 1):
-        x, y = make_batch(data)
+        x, y = make_batch(train_data)
         optimizer.zero_grad()
         logits = model.forward(x)
         loss = loss_fn.forward(logits.reshape(-1, 256), y.reshape(-1))
         model.backward(loss_fn.backward().reshape(BATCH, SEQ_LEN, 256))
+
+        grad_norm = clip_grad_norm(params, MAX_GRAD_NORM)
+        optimizer.lr = schedule(step)
         optimizer.step()
+
         if step % LOG_EVERY == 0 or step == 1:
             dt = time.time() - t0
             aux = sum(float(b.ffn.aux_loss) for b in model.blocks)
             print(f"step {step:4d}  loss {float(loss):.4f}  aux {aux:.4f}  "
+                  f"gnorm {grad_norm:7.3f}  lr {optimizer.lr:.2e}  "
                   f"({dt / step:.2f}s/step)", flush=True)
+
+    val_loss = estimate_val_loss(model, loss_fn, val_data)
+    print(f"\nheld-out val loss: {val_loss:.4f}")
 
     print("\nGate mass per expert (per block):")
     for i, block in enumerate(model.blocks):

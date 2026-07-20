@@ -37,12 +37,13 @@ class GPT2(Model):
         n_layers: int,
         max_seq_len: int = 1024,
         d_ff: int | None = None,
+        n_kv_heads: int | None = None,
     ):
         self.token_emb = Embedding(vocab_size, d_model)
         self.pos_emb = LearnedPositionalEmbedding(max_seq_len, d_model)
         self.blocks = [
             TransformerBlock(d_model, n_heads, d_ff, causal=True, activation_cls=GeLU,
-                             max_cache_len=max_seq_len)
+                             max_cache_len=max_seq_len, n_kv_heads=n_kv_heads)
             for _ in range(n_layers)
         ]
         self.norm = LayerNorm(d_model)
@@ -69,11 +70,18 @@ class GPT2(Model):
         """1.5 B parameter GPT-2 (XL)."""
         return cls(vocab_size=50257, d_model=1600, n_heads=25, n_layers=48)
 
-    def forward(self, tokens: np.ndarray, use_cache: bool = False) -> np.ndarray:
+    def forward(self, tokens: np.ndarray, use_cache: bool = False,
+                key_padding_mask: np.ndarray | None = None) -> np.ndarray:
+        """tokens (B, T) → logits (B, T, vocab_size).
+
+        `key_padding_mask` is a (B, T) boolean array with True marking padding
+        positions to ignore, for batching sequences of unequal length.
+        """
         offset = self._cache_len if use_cache else 0
         x = self.pos_emb.forward(self.token_emb.forward(tokens), offset=offset)
         for block in self.blocks:
-            x = block.forward(x, use_cache=use_cache)
+            x = block.forward(x, use_cache=use_cache,
+                              key_padding_mask=key_padding_mask)
         if use_cache:
             self._cache_len += tokens.shape[1]
         x = self.norm.forward(x)

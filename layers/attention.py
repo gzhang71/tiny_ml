@@ -48,30 +48,60 @@ class Attention(Layer):
     """
 
     def __init__(self, d_model: int, n_heads: int, causal: bool = True,
-                 max_cache_len: int = 512):
+                 max_cache_len: int = 512, n_kv_heads: int | None = None):
         assert d_model % n_heads == 0
+        n_kv_heads = n_heads if n_kv_heads is None else n_kv_heads
+        assert n_heads % n_kv_heads == 0, (
+            f"n_heads ({n_heads}) must be a multiple of n_kv_heads ({n_kv_heads})"
+        )
         self.d_model = d_model
         self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.n_rep = n_heads // n_kv_heads  # query heads sharing each KV head
         self.d_k = d_model // n_heads
         self.causal = causal
         self.max_cache_len = max_cache_len
         self.W_Q = Linear(d_model, d_model)
-        self.W_K = Linear(d_model, d_model)
-        self.W_V = Linear(d_model, d_model)
+        self.W_K = Linear(d_model, n_kv_heads * self.d_k)
+        self.W_V = Linear(d_model, n_kv_heads * self.d_k)
         self.W_O = Linear(d_model, d_model)
         self._cache_k: np.ndarray | None = None
         self._cache_v: np.ndarray | None = None
         self._cache_len = 0
+        self._key_pad: np.ndarray | None = None
 
     # ---- head bookkeeping ------------------------------------------------
 
-    def _split_heads(self, x: np.ndarray) -> np.ndarray:
+    def _split_heads(self, x: np.ndarray, n_heads: int | None = None) -> np.ndarray:
         B, T, _ = x.shape
-        return x.reshape(B, T, self.n_heads, self.d_k).transpose(0, 2, 1, 3)
+        n_heads = self.n_heads if n_heads is None else n_heads
+        return x.reshape(B, T, n_heads, self.d_k).transpose(0, 2, 1, 3)
 
     def _merge_heads(self, x: np.ndarray) -> np.ndarray:
         B, H, T, dk = x.shape
         return x.transpose(0, 2, 1, 3).reshape(B, T, H * dk)
+
+    # ---- grouped-query attention -------------------------------------------
+
+    def _repeat_kv(self, x: np.ndarray) -> np.ndarray:
+        """(B, n_kv_heads, T, d_k) → (B, n_heads, T, d_k) by repeating groups.
+
+        GQA gives each *group* of query heads one shared K/V head, so the KV
+        cache shrinks by `n_rep` — the dominant memory cost during long-context
+        decoding. Expanding here (rather than inside the attention core) keeps
+        every `_attend` implementation, including the tiled FlashAttention
+        kernels, oblivious to whether GQA is in use.
+        """
+        if self.n_rep == 1:
+            return x
+        return np.repeat(x, self.n_rep, axis=1)
+
+    def _repeat_kv_backward(self, d_x: np.ndarray) -> np.ndarray:
+        """Adjoint of `_repeat_kv`: sum the gradients of each repeated group."""
+        if self.n_rep == 1:
+            return d_x
+        B, _, T, d = d_x.shape
+        return d_x.reshape(B, self.n_kv_heads, self.n_rep, T, d).sum(axis=2)
 
     # ---- KV cache ---------------------------------------------------------
 
@@ -114,6 +144,9 @@ class Attention(Layer):
             scores = np.where(mask, -1e9, scores)
             self._causal_mask = mask
 
+        if self._key_pad is not None:
+            scores = np.where(self._key_pad, -1e9, scores)
+
         attn = _softmax(scores)
         self._Q, self._K, self._V, self._attn, self._scale = Q, K, V, attn, scale
         return attn @ V
@@ -136,16 +169,29 @@ class Attention(Layer):
 
     # ---- forward / backward -------------------------------------------------
 
-    def forward(self, x: np.ndarray, use_cache: bool = False) -> np.ndarray:
+    def forward(self, x: np.ndarray, use_cache: bool = False,
+                key_padding_mask: np.ndarray | None = None) -> np.ndarray:
+        """Self-attention over x (B, T, d_model).
+
+        `key_padding_mask` is a (B, T_k) boolean array where **True marks a
+        padding position to ignore** (PyTorch's convention). It lets a batch
+        mix sequences of different lengths: without it, attention averages in
+        whatever garbage sits in the padded slots. Reshaped to (B, 1, 1, T_k)
+        so it broadcasts over heads and queries.
+        """
         B, T, _ = x.shape
+        self._key_pad = None if key_padding_mask is None else (
+            np.asarray(key_padding_mask).reshape(B, 1, 1, -1)
+        )
         Q = self._split_heads(self.W_Q.forward(x))
-        K = self._split_heads(self.W_K.forward(x))
-        V = self._split_heads(self.W_V.forward(x))
+        K = self._split_heads(self.W_K.forward(x), self.n_kv_heads)
+        V = self._split_heads(self.W_V.forward(x), self.n_kv_heads)
         Q, K = self._position_encode(Q, K, self._cache_len if use_cache else 0)
 
         if use_cache:
             return self._forward_cached(Q, K, V, B, T)
-        return self.W_O.forward(self._merge_heads(self._attend(Q, K, V)))
+        out = self._attend(Q, self._repeat_kv(K), self._repeat_kv(V))
+        return self.W_O.forward(self._merge_heads(out))
 
     def _forward_cached(self, Q, K_new, V_new, B: int, T: int) -> np.ndarray:
         past = self._cache_len
@@ -154,7 +200,8 @@ class Attention(Layer):
             "raise max_cache_len / max_seq_len"
         )
         if self._cache_k is None:
-            shape = (B, self.n_heads, self.max_cache_len, self.d_k)
+            # cache holds n_kv_heads, not n_heads: this is the GQA memory win
+            shape = (B, self.n_kv_heads, self.max_cache_len, self.d_k)
             self._cache_k = np.zeros(shape, dtype=K_new.dtype)
             self._cache_v = np.zeros(shape, dtype=V_new.dtype)
         self._cache_k = write_slice(self._cache_k, K_new, past, axis=2)
@@ -169,6 +216,7 @@ class Attention(Layer):
             K = self._cache_k[:, :, : past + T]
             V = self._cache_v[:, :, : past + T]
 
+        K, V = self._repeat_kv(K), self._repeat_kv(V)
         scores = Q @ K.transpose(0, 1, 3, 2) / np.sqrt(self.d_k)
         bias = self._score_bias(T, K.shape[2], q_offset=past)
         if bias is not None:
@@ -179,11 +227,24 @@ class Attention(Layer):
         q_pos = past + np.arange(T)
         mask = np.arange(K.shape[2])[None, :] > q_pos[:, None]
         scores = np.where(mask, -1e9, scores)
+        if self._key_pad is not None:
+            # the mask covers the keys written so far; pad it out to the
+            # allocated cache width so it broadcasts against `scores`
+            pad = self._key_pad
+            width = K.shape[2]
+            if pad.shape[-1] < width:
+                filler = np.zeros(
+                    (*pad.shape[:-1], width - pad.shape[-1]), dtype=bool
+                )
+                pad = np.concatenate([pad.astype(bool), filler], axis=-1)
+            scores = np.where(pad, -1e9, scores)
         return self.W_O.forward(self._merge_heads(_softmax(scores) @ V))
 
     def backward(self, grad: np.ndarray) -> np.ndarray:
         d_out = self._split_heads(self.W_O.backward(grad))
         d_Q, d_K, d_V = self._attend_backward(d_out)
+        # fold each GQA group's query heads back onto its shared KV head
+        d_K, d_V = self._repeat_kv_backward(d_K), self._repeat_kv_backward(d_V)
         d_Q, d_K = self._position_encode_backward(d_Q, d_K)
         return (
             self.W_Q.backward(self._merge_heads(d_Q))
@@ -219,8 +280,10 @@ class RoPEAttention(Attention):
     """
 
     def __init__(self, d_model: int, n_heads: int, causal: bool = True,
-                 max_cache_len: int = 512, rope_base: float = 10000.0):
-        super().__init__(d_model, n_heads, causal=causal, max_cache_len=max_cache_len)
+                 max_cache_len: int = 512, n_kv_heads: int | None = None,
+                 rope_base: float = 10000.0):
+        super().__init__(d_model, n_heads, causal=causal, max_cache_len=max_cache_len,
+                         n_kv_heads=n_kv_heads)
         self.rope = RotaryPositionalEmbedding(self.d_k, max_seq_len=max_cache_len,
                                               base=rope_base)
 
@@ -244,15 +307,19 @@ class TransformerBlock(Layer):
         max_cache_len: int = 512,
         attention_cls: type[Attention] = MultiHeadAttention,
         ffn_cls: type = FeedForward,
+        n_kv_heads: int | None = None,
     ):
         self.norm1 = LayerNorm(d_model)
         self.attn = attention_cls(d_model, n_heads, causal=causal,
-                                  max_cache_len=max_cache_len)
+                                  max_cache_len=max_cache_len,
+                                  n_kv_heads=n_kv_heads)
         self.norm2 = LayerNorm(d_model)
         self.ffn = ffn_cls(d_model, d_ff, activation_cls=activation_cls)
 
-    def forward(self, x: np.ndarray, use_cache: bool = False) -> np.ndarray:
-        x = x + self.attn.forward(self.norm1.forward(x), use_cache=use_cache)
+    def forward(self, x: np.ndarray, use_cache: bool = False,
+                key_padding_mask: np.ndarray | None = None) -> np.ndarray:
+        x = x + self.attn.forward(self.norm1.forward(x), use_cache=use_cache,
+                                  key_padding_mask=key_padding_mask)
         x = x + self.ffn.forward(self.norm2.forward(x))
         return x
 
@@ -331,8 +398,9 @@ class T5SelfAttention(Attention):
     """
 
     def __init__(self, d_model: int, n_heads: int, causal: bool, n_buckets: int = 32,
-                 max_cache_len: int = 512):
-        super().__init__(d_model, n_heads, causal=causal, max_cache_len=max_cache_len)
+                 max_cache_len: int = 512, n_kv_heads: int | None = None):
+        super().__init__(d_model, n_heads, causal=causal, max_cache_len=max_cache_len,
+                         n_kv_heads=n_kv_heads)
         self.rel_bias = RelativePositionBias(n_heads, n_buckets, bidirectional=not causal)
 
     def _score_bias(self, seq_q: int, seq_k: int, q_offset: int = 0) -> np.ndarray:
@@ -364,17 +432,19 @@ class CrossAttention(Attention):
         if use_cache and self._cache_k is not None:
             K, V = self._cache_k, self._cache_v
         else:
-            K = self._split_heads(self.W_K.forward(x_enc))
-            V = self._split_heads(self.W_V.forward(x_enc))
+            K = self._split_heads(self.W_K.forward(x_enc), self.n_kv_heads)
+            V = self._split_heads(self.W_V.forward(x_enc), self.n_kv_heads)
             if use_cache:
                 self._cache_k, self._cache_v = K, V
 
-        return self.W_O.forward(self._merge_heads(self._attend(Q, K, V)))
+        out = self._attend(Q, self._repeat_kv(K), self._repeat_kv(V))
+        return self.W_O.forward(self._merge_heads(out))
 
     def backward(self, grad: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Returns (d_x_dec, d_x_enc)."""
         d_out = self._split_heads(self.W_O.backward(grad))
         d_Q, d_K, d_V = self._attend_backward(d_out)
+        d_K, d_V = self._repeat_kv_backward(d_K), self._repeat_kv_backward(d_V)
         return (
             self.W_Q.backward(self._merge_heads(d_Q)),
             self.W_K.backward(self._merge_heads(d_K)) + self.W_V.backward(self._merge_heads(d_V)),

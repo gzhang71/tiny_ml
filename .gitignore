@@ -1,2 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+
+# checkpoints written by training/checkpoint.py
+*.npz
+
+# editor / IDE
+.idea/
 *.xml
 *.iml

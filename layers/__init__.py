@@ -11,6 +11,7 @@ from layers.embedding import (
 from layers.feedforward import FeedForward, SwiGLU
 from layers.moe import MoEFeedForward
 from layers.residual import ResidualBlock
+from layers.dropout import Dropout
 from layers.attention import (
     Attention,
     MultiHeadAttention,

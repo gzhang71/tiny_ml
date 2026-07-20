@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tiny-pre-train"
+version = "0.1.0"
+description = "A from-scratch ML library in pure NumPy: autodiff primitives up to GPT-2 and T5"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+# JAX backend: TINY_PRE_TRAIN_BACKEND=jax for XLA-accelerated training
+jax = ["jax>=0.4", "jaxlib>=0.4"]
+dev = ["pytest>=7"]
+
+# The importable packages are the top-level directories, not a single package
+# named after the repo — `tiny-pre-train` is not a valid Python identifier, so
+# there is deliberately no umbrella package. `pip install -e .` puts these on
+# sys.path directly, which is what makes `from core.module import Layer` work
+# from any working directory instead of only from the repo root.
+[tool.setuptools]
+packages = [
+    "core",
+    "layers",
+    "models",
+    "losses",
+    "optim",
+    "metrics",
+    "training",
+    "examples",
+    "tests",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
