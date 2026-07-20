@@ -2,20 +2,37 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Running examples
+## Running examples and tests
 
 All commands are run from the repo root (`tiny-pre-train/`) with the venv Python:
 
 ```bash
-# Run any example
-.venv/bin/python -m examples.mlp
+.venv/bin/python -m examples.mlp     # run any example
+.venv/bin/python -m tests.run_all    # run the whole test suite
 ```
+
+The test suite has **no third-party dependencies** (there is no pytest in the venv) —
+`tests/runner.py` collects `test_*` functions itself. Keep it that way; test functions
+are named so that `pytest tests/` also works for anyone who has it.
+
+**When you change or add a layer, add a gradient check.** `tests/gradcheck.py` compares
+each hand-derived backward against central differences; `check_layer(layer, x)` covers
+both the input gradient and every `Parameter.grad`. It requires float64, so run it under
+numpy or `TINY_PRE_TRAIN_JAX_X64=1`. Two gotchas worth knowing:
+
+- The comparison has an **absolute floor** (`_ATOL`) as well as a relative tolerance.
+  Finite differences of a genuinely-zero gradient return ~1e-9 of roundoff, which a pure
+  relative metric reports as 100% error.
+- A layer whose `backward` deliberately injects an extra term (`MoEFeedForward`'s aux
+  loss) will not match a check of the main objective alone — the objective must include
+  that term too. See `test_moe_aux_loss_gradient`.
 
 The repo directory name (`tiny-pre-train`) is **not** a valid Python identifier, so the package
 cannot be imported as a whole (`python -m tiny-pre-train.examples.mlp` is a syntax error). Run
 from the repo root instead: the top-level directories (`core/`, `layers/`, …) are the
 importable packages, and the cwd on `sys.path` is what makes `from core.module import Layer`
-resolve.
+resolve. `pip install -e .` (see `pyproject.toml`) installs those directories as
+top-level packages, which lifts the run-from-repo-root requirement.
 
 ## Architecture
 
@@ -28,7 +45,13 @@ This is a pure-numpy autodiff library. Every object participates in a manual for
 - `Layer(Module)` — building block (no semantics beyond naming)
 - `Model(Module)` — top-level model (no semantics beyond naming)
 - `Loss` — separate hierarchy; `forward` returns a scalar, `backward` returns `d_loss/d_pred` with no arguments (stores state from the last forward)
-- `Optimizer` — takes a flat list of `Parameter` objects and mutates `.data` in `step()`
+- `Optimizer` — takes a flat list of `Parameter` objects and mutates `.data` in `step()`;
+  `parameters()` exposes that list (used by gradient clipping)
+- **Train/eval mode** — `Module.training` (class-level default `True`), set recursively by
+  `model.train()` / `model.eval()`. `Module.modules()` does the traversal by walking
+  `__dict__` the same way `parameters()` does — it deliberately does *not* go through
+  `parameters()`, since layers like `Attention` override that to return a hand-built list
+  and `_TiedProjection` returns nothing at all. Only `Dropout` reads the flag today
 
 ### Import convention
 
@@ -89,6 +112,25 @@ Each layer stores the inputs it needs for backward in `self._<name>` during `for
   router probs): `forward` stores the scalar in `.aux_loss` for reporting, and
   `backward` injects its gradient into the router directly, so the upstream grad
   stays that of the main loss. Without it top-k routing collapses onto 1-2 experts.
+- **`Dropout`** in `layers/dropout.py` — inverted dropout: the mask is applied *and*
+  rescaled by 1/(1−p) at training time, so `forward` is an exact identity once
+  `model.eval()` is called. It is the only layer whose behavior depends on
+  `Module.training`. The mask is drawn via `backend.rand` (numpy's RNG in both
+  backends, so seeding is reproducible) and saved for backward, per the layer contract.
+- **Grouped-query attention** — `Attention(..., n_kv_heads=k)` gives each group of
+  `n_heads // k` query heads one shared K/V head (`k=1` is multi-query attention). The
+  K/V projections shrink to `k · d_k` and **the KV cache holds only `k` heads**, which is
+  the point: KV cache size dominates long-context decoding. Expansion happens in
+  `_repeat_kv` *between* the projections and the attention core, so every `_attend`
+  implementation — including the tiled FlashAttention kernels — is oblivious to GQA.
+  `_repeat_kv_backward` sums each group's gradients back onto its shared head.
+- **Key padding masks** — `forward(x, key_padding_mask=mask)` where `mask` is `(B, T_k)`
+  and **True marks padding to ignore** (PyTorch's convention). Reshaped to `(B, 1, 1, T_k)`
+  so it broadcasts over heads and queries; applied in the dense path, the cached decode
+  path, and the flash kernels (per-tile key slice in `_masked_scores`). Masked entries get
+  −1e9, which underflows to exactly 0 after the exp, so backward needs no separate
+  masking. `TransformerBlock` and `GPT2` plumb the argument through; `Transformer` and
+  `T5` do not yet.
 - **KV cache (inference-only, static)** — attention layers take `forward(x, use_cache=True)`: self-attention writes new K/V into a cache **preallocated at `max_cache_len`** (`backend.write_slice`) and masks by absolute position, which hides both future tokens and unwritten padded slots (padding contributes exactly 0 after softmax, so results are exact). Static shapes matter: in jax mode a growing cache would recompile every op on every decode step. The jax path attends over the full padded cache; the numpy path slices to the valid prefix since it has no compile cache to protect. `CrossAttention` computes encoder K/V once and reuses them. Positional embeddings take an `offset` (applied via `backend.take_slice` — same recompile concern); models track it in `_cache_len`. `generate()` prefills on the prompt then decodes one token per step, collecting tokens in a Python list (a growing array concat would also recompile per step). `reset_cache()` clears everything. `backward` assumes the last forward was uncached — never train with `use_cache=True`.
 
 ### Directory layout
@@ -96,15 +138,30 @@ Each layer stores the inputs it needs for backward in `self._<name>` during `for
 ```
 core/        — Parameter, Module, Layer, Model, Loss, Optimizer base classes
 layers/      — reusable building blocks (Linear, activations, LayerNorm, RMSNorm,
-               Embedding variants, FeedForward, SwiGLU, MoEFeedForward,
+               Embedding variants, FeedForward, SwiGLU, MoEFeedForward, Dropout,
                ResidualBlock, attention classes, Head variants)
 models/      — full models composed from layers (MLP, ResNet, Sequential,
                Transformer, GPT2, T5, VAE)
-losses/      — MSELoss, SoftmaxCrossEntropy, BinaryCrossEntropy
-optim/       — SGD, Momentum, ADAM
+losses/      — MSELoss, SoftmaxCrossEntropy, BinaryCrossEntropy, BCEWithLogits.
+               SoftmaxCrossEntropy picks the target form by *shape* (labels are
+               the logits shape minus the class axis; one-hot is the full logits
+               shape) and raises otherwise — sniffing `ndim` instead silently
+               misreads (B, T) labels as one-hot. It averages over all leading
+               dims, so (B, T, C) and its flattened (B*T, C) form agree.
+optim/       — SGD, Momentum, ADAM, AdamW (+ decay_groups), schedule.py
+               (ConstantLR, LinearWarmup, CosineWithWarmup, InverseSqrt — a
+               schedule is just a callable step->lr), clip.py (clip_grad_norm)
 metrics/     — precision, recall, f1_score, accuracy (binary classification)
-training/    — Trainer (fit / predict / evaluate loop); checkpoint.py
+training/    — Trainer (fit / predict / evaluate; optional lr_schedule,
+               max_grad_norm, grad_accum_steps, val_data). Accumulation scales
+               each micro-batch's loss gradient by 1/k so k micro-batches equal
+               one k-times-larger batch; `Trainer.step` counts optimizer steps,
+               not micro-batches, so schedules stay correct. checkpoint.py
                (get_state/set_state/average_states — a "state" is a list of
-               array copies in model.parameters() order)
+               array copies in model.parameters() order — plus save/load to .npz,
+               which always writes real numpy so checkpoints cross backends)
+tests/       — gradcheck.py (finite differences) + test_gradients.py,
+               test_invariants.py, test_training.py; runner.py is the
+               dependency-free collector, `python -m tests.run_all` runs everything
 examples/    — one runnable script per model
 ```

@@ -80,6 +80,12 @@ def randn(*shape):
     return xp.asarray(_np.random.randn(*shape))
 
 
+def rand(*shape):
+    """Uniform [0, 1) sample as a backend array, drawn with numpy's RNG
+    so `np.random.seed(...)` gives identical draws in both modes."""
+    return xp.asarray(_np.random.rand(*shape))
+
+
 def sample_categorical(probs) -> int:
     """Draw one index from a probability vector (any backend's array)."""
     p = _np.asarray(probs, dtype=_np.float64)

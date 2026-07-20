@@ -32,21 +32,26 @@ from core.backend import xp as np
 from layers.attention import Attention
 
 
-def _masked_scores(Q_blk, K_blk, scale, causal, i0, i1, j0, j1):
-    """Scaled scores for one tile, with the causal mask applied in-tile.
+def _masked_scores(Q_blk, K_blk, scale, causal, i0, i1, j0, j1, key_pad=None):
+    """Scaled scores for one tile, with causal and padding masks applied in-tile.
 
     Masked entries get -1e9 (matching the rest of the library), which
     underflows to an exact 0 after the exp — including in the backward
     recomputation, so dS needs no separate mask.
+
+    `key_pad` is the layer's (B, 1, 1, T_k) padding mask; only this tile's
+    key slice is applied, and it broadcasts over heads and queries.
     """
     S = Q_blk @ K_blk.transpose(0, 1, 3, 2) / scale
     if causal and j1 - 1 > i0:
         mask = np.arange(j0, j1)[None, :] > np.arange(i0, i1)[:, None]
         S = np.where(mask, -1e9, S)
+    if key_pad is not None:
+        S = np.where(key_pad[..., j0:j1], -1e9, S)
     return S
 
 
-def _flash_attention_forward(Q, K, V, scale, causal, block_q, block_k):
+def _flash_attention_forward(Q, K, V, scale, causal, block_q, block_k, key_pad=None):
     """FlashAttention v1 forward. Returns (O, L) with L the per-row logsumexp.
 
     Outer loop over K/V blocks: each Q block's output is renormalized by the
@@ -70,7 +75,7 @@ def _flash_attention_forward(Q, K, V, scale, causal, block_q, block_k):
             i1 = min(i0 + block_q, T)
             if causal and j0 > i1 - 1:
                 continue  # tile entirely above the diagonal
-            S = _masked_scores(Q[:, :, i0:i1], Kj, scale, causal, i0, i1, j0, j1)
+            S = _masked_scores(Q[:, :, i0:i1], Kj, scale, causal, i0, i1, j0, j1, key_pad)
             m_blk = S.max(axis=-1)
             P = np.exp(S - m_blk[..., None])
             l_blk = P.sum(axis=-1)
@@ -88,7 +93,7 @@ def _flash_attention_forward(Q, K, V, scale, causal, block_q, block_k):
     )
 
 
-def _flash_attention2_forward(Q, K, V, scale, causal, block_q, block_k):
+def _flash_attention2_forward(Q, K, V, scale, causal, block_q, block_k, key_pad=None):
     """FlashAttention-2 forward. Returns (O, L) with L the per-row logsumexp.
 
     Outer loop over Q blocks: the accumulator stays unnormalized inside the
@@ -108,7 +113,7 @@ def _flash_attention2_forward(Q, K, V, scale, causal, block_q, block_k):
             if causal and j0 > i1 - 1:
                 break  # this and all later tiles are above the diagonal
             j1 = min(j0 + block_k, Tk)
-            S = _masked_scores(Qi, K[:, :, j0:j1], scale, causal, i0, i1, j0, j1)
+            S = _masked_scores(Qi, K[:, :, j0:j1], scale, causal, i0, i1, j0, j1, key_pad)
             m_new = np.maximum(m, S.max(axis=-1))
             P = np.exp(S - m_new[..., None])
             corr = np.exp(m - m_new)
@@ -120,7 +125,8 @@ def _flash_attention2_forward(Q, K, V, scale, causal, block_q, block_k):
     return np.concatenate(outs, axis=2), np.concatenate(lses, axis=2)
 
 
-def _flash_attention_backward(dO, Q, K, V, O, L, scale, causal, block_q, block_k):
+def _flash_attention_backward(dO, Q, K, V, O, L, scale, causal, block_q, block_k,
+                              key_pad=None):
     """Tiled backward shared by v1 and v2. Returns (dQ, dK, dV).
 
     Recomputes each tile's probabilities as P = exp(S − L) from the saved
@@ -144,7 +150,7 @@ def _flash_attention_backward(dO, Q, K, V, O, L, scale, causal, block_q, block_k
             if causal and j0 > i1 - 1:
                 continue
             Qi, dOi = Q[:, :, i0:i1], dO[:, :, i0:i1]
-            S = _masked_scores(Qi, Kj, scale, causal, i0, i1, j0, j1)
+            S = _masked_scores(Qi, Kj, scale, causal, i0, i1, j0, j1, key_pad)
             P = np.exp(S - L[:, :, i0:i1][..., None])
             dVj = dVj + P.transpose(0, 1, 3, 2) @ dOi
             dP = dOi @ Vj.transpose(0, 1, 3, 2)
@@ -173,8 +179,10 @@ class FlashAttention(Attention):
     """
 
     def __init__(self, d_model: int, n_heads: int, causal: bool = True,
-                 max_cache_len: int = 512, block_q: int = 64, block_k: int = 64):
-        super().__init__(d_model, n_heads, causal=causal, max_cache_len=max_cache_len)
+                 max_cache_len: int = 512, n_kv_heads: int | None = None,
+                 block_q: int = 64, block_k: int = 64):
+        super().__init__(d_model, n_heads, causal=causal, max_cache_len=max_cache_len,
+                         n_kv_heads=n_kv_heads)
         self.block_q = block_q
         self.block_k = block_k
 
@@ -183,14 +191,14 @@ class FlashAttention(Attention):
     def _attend(self, Q: np.ndarray, K: np.ndarray, V: np.ndarray) -> np.ndarray:
         scale = np.sqrt(self.d_k)
         O, L = self._flash_forward(Q, K, V, scale, self.causal,
-                                   self.block_q, self.block_k)
+                                   self.block_q, self.block_k, self._key_pad)
         self._Q, self._K, self._V, self._O, self._L, self._scale = Q, K, V, O, L, scale
         return O
 
     def _attend_backward(self, d_out: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         return _flash_attention_backward(
             d_out, self._Q, self._K, self._V, self._O, self._L,
-            self._scale, self.causal, self.block_q, self.block_k,
+            self._scale, self.causal, self.block_q, self.block_k, self._key_pad,
         )
 
 
