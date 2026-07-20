@@ -83,7 +83,11 @@ Each layer stores the inputs it needs for backward in `self._<name>` during `for
   trained FFN: experts are deep copies, router is zero → output exactly equals the dense
   FFN, but that configuration is a stationary point (identical experts ⇒ identical expert
   grads and exactly-zero router grad), so pass `router_scale>0` or jitter the router
-  in place to let experts specialize.
+  in place to let experts specialize. `aux_coef>0` enables the Switch-style
+  load-balancing loss α·E·Σ f_e·P_e (f = hard routing fractions, constant; P = mean
+  router probs): `forward` stores the scalar in `.aux_loss` for reporting, and
+  `backward` injects its gradient into the router directly, so the upstream grad
+  stays that of the main loss. Without it top-k routing collapses onto 1-2 experts.
 - **KV cache (inference-only, static)** — attention layers take `forward(x, use_cache=True)`: self-attention writes new K/V into a cache **preallocated at `max_cache_len`** (`backend.write_slice`) and masks by absolute position, which hides both future tokens and unwritten padded slots (padding contributes exactly 0 after softmax, so results are exact). Static shapes matter: in jax mode a growing cache would recompile every op on every decode step. The jax path attends over the full padded cache; the numpy path slices to the valid prefix since it has no compile cache to protect. `CrossAttention` computes encoder K/V once and reuses them. Positional embeddings take an `offset` (applied via `backend.take_slice` — same recompile concern); models track it in `_cache_len`. `generate()` prefills on the prompt then decodes one token per step, collecting tokens in a Python list (a growing array concat would also recompile per step). `reset_cache()` clears everything. `backward` assumes the last forward was uncached — never train with `use_cache=True`.
 
 ### Directory layout

@@ -3,6 +3,8 @@ Train a ~170M-parameter Mixture-of-Experts GPT-2 byte-level on this repo's own
 source code. Same recipe as examples/train_100m.py, but each block's dense FFN
 is replaced with a 4-expert top-2 MoEFeedForward and the layer count is halved
 — more total parameters than the dense 113M model, fewer active per token.
+A Switch-style load-balancing aux loss (AUX_COEF, default 0.01) keeps the
+routers from collapsing onto 1-2 experts; set AUX_COEF=0 to watch them collapse.
 Run (from repo root, JAX float32 backend strongly recommended):
     TINY_ML_BACKEND=jax TINY_ML_JAX_X64=0 .venv/bin/python examples/train_100m_moe.py
 """
@@ -27,6 +29,7 @@ N_LAYERS = 8
 N_EXPERTS = 4
 TOP_K = 2
 STEPS = int(os.environ.get("TRAIN_STEPS", 150))
+AUX_COEF = float(os.environ.get("AUX_COEF", 0.01))  # 0 → routers collapse onto 1-2 experts
 LOG_EVERY = 5
 
 
@@ -58,7 +61,8 @@ def main():
     model = GPT2(vocab_size=256, d_model=D_MODEL, n_heads=12, n_layers=N_LAYERS,
                  max_seq_len=256)
     for block in model.blocks:
-        block.ffn = MoEFeedForward(D_MODEL, n_experts=N_EXPERTS, top_k=TOP_K)
+        block.ffn = MoEFeedForward(D_MODEL, n_experts=N_EXPERTS, top_k=TOP_K,
+                                   aux_coef=AUX_COEF)
 
     total = n_params(model)
     expert = n_params(model.blocks[0].ffn.experts[0])
@@ -80,7 +84,9 @@ def main():
         optimizer.step()
         if step % LOG_EVERY == 0 or step == 1:
             dt = time.time() - t0
-            print(f"step {step:4d}  loss {float(loss):.4f}  ({dt / step:.2f}s/step)", flush=True)
+            aux = sum(float(b.ffn.aux_loss) for b in model.blocks)
+            print(f"step {step:4d}  loss {float(loss):.4f}  aux {aux:.4f}  "
+                  f"({dt / step:.2f}s/step)", flush=True)
 
     print("\nGate mass per expert (per block):")
     for i, block in enumerate(model.blocks):
