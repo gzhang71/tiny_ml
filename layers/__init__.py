@@ -1,6 +1,6 @@
 from layers.linear import Linear
-from layers.activations import ReLU, Sigmoid, Tanh, GeLU
-from layers.normalization import LayerNorm
+from layers.activations import ReLU, Sigmoid, Tanh, SiLU, GeLU
+from layers.normalization import LayerNorm, RMSNorm
 from layers.embedding import (
     Embedding,
     SinusoidalPositionalEmbedding,
@@ -8,7 +8,7 @@ from layers.embedding import (
     LearnedPositionalEmbedding,
     FeatureEmbedding,
 )
-from layers.feedforward import FeedForward
+from layers.feedforward import FeedForward, SwiGLU
 from layers.residual import ResidualBlock
 from layers.attention import (
     Attention,

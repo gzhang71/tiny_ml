@@ -71,6 +71,7 @@ class Transformer(Model):
         max_new_tokens: int = 50,
         temperature: float = 1.0,
         top_k: int | None = None,
+        top_p: float | None = None,
     ) -> np.ndarray:
         """Autoregressive token generation with a KV cache.
 
@@ -90,6 +91,16 @@ class Transformer(Model):
 
             if top_k is not None:
                 threshold = np.sort(next_logits)[-top_k]
+                next_logits = np.where(next_logits >= threshold, next_logits, -1e9)
+
+            if top_p is not None:
+                sorted_logits = np.sort(next_logits)[::-1]
+                sorted_probs = np.exp(sorted_logits - sorted_logits[0])
+                sorted_probs = sorted_probs / sorted_probs.sum()
+                # keep the smallest prefix whose mass reaches top_p (≥ 1 token):
+                # a token stays if the mass strictly before it is < top_p
+                keep = (np.cumsum(sorted_probs) - sorted_probs) < top_p
+                threshold = np.where(keep, sorted_logits, sorted_logits[0]).min()
                 next_logits = np.where(next_logits >= threshold, next_logits, -1e9)
 
             probs = np.exp(next_logits - next_logits.max())

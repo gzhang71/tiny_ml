@@ -80,9 +80,9 @@ Each layer stores the inputs it needs for backward in `self._<name>` during `for
 
 ```
 core/        — Parameter, Module, Layer, Model, Loss, Optimizer base classes
-layers/      — reusable building blocks (Linear, activations, LayerNorm,
-               Embedding variants, FeedForward, ResidualBlock, attention classes,
-               Head variants)
+layers/      — reusable building blocks (Linear, activations, LayerNorm, RMSNorm,
+               Embedding variants, FeedForward, SwiGLU, ResidualBlock,
+               attention classes, Head variants)
 models/      — full models composed from layers (MLP, ResNet, Sequential,
                Transformer, GPT2, T5, VAE)
 losses/      — MSELoss, SoftmaxCrossEntropy, BinaryCrossEntropy

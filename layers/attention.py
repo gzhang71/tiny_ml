@@ -243,12 +243,13 @@ class TransformerBlock(Layer):
         activation_cls=None,
         max_cache_len: int = 512,
         attention_cls: type[Attention] = MultiHeadAttention,
+        ffn_cls: type = FeedForward,
     ):
         self.norm1 = LayerNorm(d_model)
         self.attn = attention_cls(d_model, n_heads, causal=causal,
                                   max_cache_len=max_cache_len)
         self.norm2 = LayerNorm(d_model)
-        self.ffn = FeedForward(d_model, d_ff, activation_cls=activation_cls)
+        self.ffn = ffn_cls(d_model, d_ff, activation_cls=activation_cls)
 
     def forward(self, x: np.ndarray, use_cache: bool = False) -> np.ndarray:
         x = x + self.attn.forward(self.norm1.forward(x), use_cache=use_cache)

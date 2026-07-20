@@ -32,6 +32,18 @@ class Tanh(Activation):
         return grad * (1.0 - self._out ** 2)
 
 
+class SiLU(Activation):
+    """SiLU / Swish: x * sigmoid(x)."""
+
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        self._x = x
+        self._sig = 1.0 / (1.0 + np.exp(-x))
+        return x * self._sig
+
+    def backward(self, grad: np.ndarray) -> np.ndarray:
+        return grad * self._sig * (1.0 + self._x * (1.0 - self._sig))
+
+
 class GeLU(Activation):
     """Tanh-approximated GeLU (used by GPT-2).
 

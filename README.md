@@ -6,10 +6,12 @@ A from-scratch machine learning library built on pure NumPy — no PyTorch, no T
 
 **Layers**
 - `Linear` — fully connected layer with He initialization
-- Activations: `ReLU`, `Sigmoid`, `Tanh`, `GeLU`
+- Activations: `ReLU`, `Sigmoid`, `Tanh`, `SiLU`, `GeLU`
 - `LayerNorm` — with learnable `gamma`/`beta`
+- `RMSNorm` — LayerNorm without mean-centering or bias (Llama-style)
 - `Embedding`, `SinusoidalPositionalEmbedding`, `LearnedPositionalEmbedding`, `FeatureEmbedding`
 - `FeedForward` — position-wise FFN with configurable activation and expansion factor
+- `SwiGLU` — gated FFN `W2(SiLU(W1x) ⊙ W3x)`; swap into `TransformerBlock` via `ffn_cls=SwiGLU`
 - `ResidualBlock` — two-layer MLP-style residual block
 - `MultiHeadAttention` — scaled dot-product with optional causal mask
 - `TransformerBlock` — pre-norm residual (attention + FFN)
@@ -97,10 +99,10 @@ tiny_ml/
 │   └── backend.py         #   array backend (numpy or jax.numpy via TINY_ML_BACKEND)
 ├── layers/                # reusable building blocks
 │   ├── linear.py          #   Linear
-│   ├── activations.py     #   ReLU, Sigmoid, Tanh, GeLU
-│   ├── normalization.py   #   LayerNorm
+│   ├── activations.py     #   ReLU, Sigmoid, Tanh, SiLU, GeLU
+│   ├── normalization.py   #   LayerNorm, RMSNorm
 │   ├── embedding.py       #   Embedding + positional/feature variants
-│   ├── feedforward.py     #   FeedForward (position-wise FFN)
+│   ├── feedforward.py     #   FeedForward, SwiGLU (position-wise FFNs)
 │   ├── residual.py        #   ResidualBlock
 │   └── attention.py       #   MultiHeadAttention, TransformerBlock, T5/cross attention
 ├── models/                # full models composed from layers
