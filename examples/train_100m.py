@@ -1,7 +1,7 @@
 """
 Train a ~113M-parameter GPT-2 style model byte-level on this repo's own source code.
 Run (from repo root, JAX float32 backend strongly recommended):
-    TINY_ML_BACKEND=jax TINY_ML_JAX_X64=0 .venv/bin/python examples/train_100m.py
+    TINY_PRE_TRAIN_BACKEND=jax TINY_PRE_TRAIN_JAX_X64=0 .venv/bin/python examples/train_100m.py
 """
 import os
 import sys

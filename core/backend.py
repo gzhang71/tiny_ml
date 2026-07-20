@@ -1,13 +1,13 @@
 """Array backend selection: numpy (default) or JAX.
 
 Select the backend with an environment variable, set BEFORE importing any
-tiny_ml module:
+tiny-pre-train module:
 
-    TINY_ML_BACKEND=jax python -c "from examples.gpt2 import main; main()"
+    TINY_PRE_TRAIN_BACKEND=jax python -c "from examples.gpt2 import main; main()"
 
 In jax mode every `np.` call inside the library resolves to `jax.numpy`, so
 matmuls and elementwise ops run through XLA. float64 is enabled by default so
-results match numpy exactly; set TINY_ML_JAX_X64=0 for float32, which is
+results match numpy exactly; set TINY_PRE_TRAIN_JAX_X64=0 for float32, which is
 considerably faster and the usual choice when speed is the point.
 
 JAX arrays are immutable, so the library never mutates arrays in place:
@@ -20,11 +20,11 @@ import os
 
 import numpy as _np
 
-BACKEND = os.environ.get("TINY_ML_BACKEND", "numpy").lower()
+BACKEND = os.environ.get("TINY_PRE_TRAIN_BACKEND", "numpy").lower()
 
 if BACKEND == "jax":
     from jax import config as _jax_config
-    _jax_config.update("jax_enable_x64", os.environ.get("TINY_ML_JAX_X64", "1") != "0")
+    _jax_config.update("jax_enable_x64", os.environ.get("TINY_PRE_TRAIN_JAX_X64", "1") != "0")
     import jax.numpy as xp
     from jax import lax as _lax
 else:

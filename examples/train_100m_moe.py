@@ -6,7 +6,7 @@ is replaced with a 4-expert top-2 MoEFeedForward and the layer count is halved
 A Switch-style load-balancing aux loss (AUX_COEF, default 0.01) keeps the
 routers from collapsing onto 1-2 experts; set AUX_COEF=0 to watch them collapse.
 Run (from repo root, JAX float32 backend strongly recommended):
-    TINY_ML_BACKEND=jax TINY_ML_JAX_X64=0 .venv/bin/python examples/train_100m_moe.py
+    TINY_PRE_TRAIN_BACKEND=jax TINY_PRE_TRAIN_JAX_X64=0 .venv/bin/python examples/train_100m_moe.py
 """
 import os
 import sys

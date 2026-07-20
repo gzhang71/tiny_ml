@@ -4,17 +4,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Running examples
 
-All commands are run from the repo root (`tiny_ml/`) with the venv Python:
+All commands are run from the repo root (`tiny-pre-train/`) with the venv Python:
 
 ```bash
 # Run any example
-.venv/bin/python -c "import sys; sys.path.insert(0, '..'); from examples.mlp import main; main()"
-
-# Or from the parent directory
-cd .. && tiny_ml/.venv/bin/python -m tiny_ml.examples.mlp
+.venv/bin/python -m examples.mlp
 ```
 
-Because the package root is `tiny_ml/`, Python must be invoked from the **parent directory** for `-m` module syntax to work, or the parent must be added to `sys.path` manually.
+The repo directory name (`tiny-pre-train`) is **not** a valid Python identifier, so the package
+cannot be imported as a whole (`python -m tiny-pre-train.examples.mlp` is a syntax error). Run
+from the repo root instead: the top-level directories (`core/`, `layers/`, …) are the
+importable packages, and the cwd on `sys.path` is what makes `from core.module import Layer`
+resolve.
 
 ## Architecture
 
@@ -31,18 +32,18 @@ This is a pure-numpy autodiff library. Every object participates in a manual for
 
 ### Import convention
 
-All internal imports use **package-relative paths without the `tiny_ml.` prefix**:
+All internal imports use **paths relative to the repo root, with no top-level package prefix**:
 ```python
 from core.module import Layer
 from layers.linear import Linear
 ```
-This requires the repo root (`tiny_ml/`) to be on `sys.path`.
+This requires the repo root (`tiny-pre-train/`) to be on `sys.path`.
 
 ### Array backend (numpy / JAX)
 
 Library modules never import numpy directly — they use `from core.backend import xp as np`,
-which resolves to numpy (default) or `jax.numpy` when `TINY_ML_BACKEND=jax` is set before
-import. `TINY_ML_JAX_X64=0` switches JAX to float32 (faster; float64 default matches numpy
+which resolves to numpy (default) or `jax.numpy` when `TINY_PRE_TRAIN_BACKEND=jax` is set before
+import. `TINY_PRE_TRAIN_JAX_X64=0` switches JAX to float32 (faster; float64 default matches numpy
 bit-for-bit). Rules that keep code backend-portable:
 
 - **No in-place array mutation.** JAX arrays are immutable. Attribute-level `p.grad += g` is

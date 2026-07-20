@@ -1,4 +1,4 @@
-# tiny_ml
+# tiny-pre-train
 
 A from-scratch machine learning library built on pure NumPy — no PyTorch, no TensorFlow. Implements the full stack from basic autodiff primitives up to GPT-2 and T5.
 
@@ -36,20 +36,20 @@ A from-scratch machine learning library built on pure NumPy — no PyTorch, no T
 
 ## Running examples
 
-Each model has a self-contained example in `examples/`. Run from the parent directory of this repo:
+Each model has a self-contained example in `examples/`. Run from the repo root (`tiny-pre-train/`):
 
 ```bash
-python -m tiny_ml.examples.mlp          # spiral classification
-python -m tiny_ml.examples.sequential   # sine wave regression
-python -m tiny_ml.examples.resnet       # checkerboard classification
-python -m tiny_ml.examples.transformer  # next-token prediction
-python -m tiny_ml.examples.gpt2         # token generation
-python -m tiny_ml.examples.t5           # seq2seq copy task
-python -m tiny_ml.examples.vae          # 2D cluster reconstruction
-python -m tiny_ml.examples.checkpoint_averaging  # averaged snapshots beat the last one
-python -m tiny_ml.examples.moe_upcycle  # dense→MoE upcycling, then expert specialization
-python -m tiny_ml.examples.train_100m       # 113.8M-param dense GPT-2 on this repo's source
-python -m tiny_ml.examples.train_100m_moe   # 170.5M-param MoE GPT-2 (94.9M active/token)
+python -m examples.mlp          # spiral classification
+python -m examples.sequential   # sine wave regression
+python -m examples.resnet       # checkerboard classification
+python -m examples.transformer  # next-token prediction
+python -m examples.gpt2         # token generation
+python -m examples.t5           # seq2seq copy task
+python -m examples.vae          # 2D cluster reconstruction
+python -m examples.checkpoint_averaging  # averaged snapshots beat the last one
+python -m examples.moe_upcycle  # dense→MoE upcycling, then expert specialization
+python -m examples.train_100m       # 113.8M-param dense GPT-2 on this repo's source
+python -m examples.train_100m_moe   # 170.5M-param MoE GPT-2 (94.9M active/token)
 ```
 
 ## Workflow
@@ -98,11 +98,11 @@ optimizer.step()                # mutates .data on all Parameters
 ## Architecture
 
 ```
-tiny_ml/
+tiny-pre-train/
 ├── core/                  # foundations everything else builds on
 │   ├── parameter.py       #   Parameter — numpy array + .grad field (the only weight leaf)
 │   ├── module.py          #   Module, Layer, Model, Loss, Optimizer base classes
-│   └── backend.py         #   array backend (numpy or jax.numpy via TINY_ML_BACKEND)
+│   └── backend.py         #   array backend (numpy or jax.numpy via TINY_PRE_TRAIN_BACKEND)
 ├── layers/                # reusable building blocks
 │   ├── linear.py          #   Linear
 │   ├── activations.py     #   ReLU, Sigmoid, Tanh, SiLU, GeLU
@@ -135,12 +135,12 @@ tiny_ml/
 
 ## JAX backend (optional speedup)
 
-The library runs on numpy by default. Set `TINY_ML_BACKEND=jax` to route every array
+The library runs on numpy by default. Set `TINY_PRE_TRAIN_BACKEND=jax` to route every array
 operation through `jax.numpy`/XLA instead — no code changes needed:
 
 ```bash
-TINY_ML_BACKEND=jax python -m tiny_ml.examples.gpt2      # float64, matches numpy exactly
-TINY_ML_BACKEND=jax TINY_ML_JAX_X64=0 python -m tiny_ml.examples.gpt2  # float32, fastest
+TINY_PRE_TRAIN_BACKEND=jax python -m examples.gpt2      # float64, matches numpy exactly
+TINY_PRE_TRAIN_BACKEND=jax TINY_PRE_TRAIN_JAX_X64=0 python -m examples.gpt2  # float32, fastest
 ```
 
 With the same seed, jax float64 mode reproduces numpy results (bit-for-bit for GPT-2 /
@@ -222,4 +222,4 @@ therefore 4× the model size, plus activations; inference needs only the weights
 
 - Python 3.10+
 - NumPy
-- JAX (optional, only for `TINY_ML_BACKEND=jax`)
+- JAX (optional, only for `TINY_PRE_TRAIN_BACKEND=jax`)
