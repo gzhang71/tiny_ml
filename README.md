@@ -174,15 +174,20 @@ see the design note in `layers/moe.py`.)
 | model | config | params (total) | params (active/token) | step time | loss step 1 → 150 | final ppl |
 |---|---|--:|--:|--:|--|--:|
 | dense GPT-2 | d768, 12h, 16L | 113,800,704 | 113,800,704 | 1.35 s | 5.85 → 2.79 | 16.3 |
-| MoE GPT-2 | d768, 12h, 8L, 4e top-2 | 170,460,704 | 94,901,792 | 1.68 s | 5.69 → 2.65 | 14.1 |
+| MoE GPT-2 | d768, 12h, 8L, 4e top-2 | 170,460,704 | 94,901,792 | 1.66 s | 5.69 → 2.78 | 16.2 |
 
 150 steps ≈ 150K tokens seen — enough for loss to fall well below the uniform-random
 5.55 and for samples to pick up code-shaped structure (indentation, `self`, call
 syntax), not enough for real code. Both scripts accept `TRAIN_STEPS=` to go longer.
-One instructive artifact of the MoE run: with no load-balancing auxiliary loss, most
-blocks collapse onto one or two dominant experts (per-block gate mass like
-0.98/0.01/0.00/0.00) — exactly the failure mode the aux losses in production MoEs
-(Switch, Mixtral) exist to prevent.
+The MoE run trains with the Switch-style load-balancing aux loss
+(`MoEFeedForward(aux_coef=0.01)`, the script's default), which keeps routing spread
+across experts (typical per-block gate mass 0.38/0.24/0.22/0.16). Set `AUX_COEF=0`
+to watch the routers collapse onto one or two dominant experts
+(0.98/0.01/0.00/0.00) — the rich-get-richer failure mode aux losses exist to
+prevent. Honest caveat: at this tiny scale the collapsed run actually reaches a
+*lower* train loss (2.65 vs 2.78) — the balance tax is real, and its payoff
+(all experts trained, even device load under sparse dispatch) only shows up at
+scale. This trade-off is why DeepSeek-V3 moved to aux-loss-free balancing.
 
 ### Parameter breakdown
 
@@ -211,7 +216,7 @@ therefore 4× the model size, plus activations; inference needs only the weights
 | `p.data` | forward (weights) | 1× params | 113.8M | 170.5M |
 | `p.grad` | backward (gradients) | 1× params | 113.8M | 170.5M |
 | ADAM `m`, `v` | optimizer (moments) | 2× params | 227.6M | 340.9M |
-| **total training floats** | | **4× params** | **455.2M (~1.8 GB @ fp32)** | **681.8M (~2.7 GB @ fp32)** |
+| **total training floats** | — | **4× params** | **455.2M (~1.8 GB @ fp32)** | **681.8M (~2.7 GB @ fp32)** |
 
 ## Dependencies
 
