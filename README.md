@@ -12,6 +12,7 @@ A from-scratch machine learning library built on pure NumPy — no PyTorch, no T
 - `Embedding`, `SinusoidalPositionalEmbedding`, `LearnedPositionalEmbedding`, `FeatureEmbedding`
 - `FeedForward` — position-wise FFN with configurable activation and expansion factor
 - `SwiGLU` — gated FFN `W2(SiLU(W1x) ⊙ W3x)`; swap into `TransformerBlock` via `ffn_cls=SwiGLU`
+- `MoEFeedForward` — mixture-of-experts FFN with top-k routing; `from_dense()` upcycles a trained dense FFN into experts
 - `ResidualBlock` — two-layer MLP-style residual block
 - `MultiHeadAttention` — scaled dot-product with optional causal mask
 - `TransformerBlock` — pre-norm residual (attention + FFN)
@@ -31,6 +32,7 @@ A from-scratch machine learning library built on pure NumPy — no PyTorch, no T
 - Optimizers: `SGD`, `Momentum`, `ADAM`
 - Metrics: `precision`, `recall`, `f1_score`, `accuracy`
 - `Trainer` — batched fit/predict/evaluate loop
+- Checkpoint utils — `get_state` / `set_state` / `average_states` (checkpoint averaging)
 
 ## Running examples
 
@@ -44,6 +46,10 @@ python -m tiny_ml.examples.transformer  # next-token prediction
 python -m tiny_ml.examples.gpt2         # token generation
 python -m tiny_ml.examples.t5           # seq2seq copy task
 python -m tiny_ml.examples.vae          # 2D cluster reconstruction
+python -m tiny_ml.examples.checkpoint_averaging  # averaged snapshots beat the last one
+python -m tiny_ml.examples.moe_upcycle  # dense→MoE upcycling, then expert specialization
+python -m tiny_ml.examples.train_100m       # 113.8M-param dense GPT-2 on this repo's source
+python -m tiny_ml.examples.train_100m_moe   # 170.5M-param MoE GPT-2 (94.9M active/token)
 ```
 
 ## Workflow
@@ -103,6 +109,7 @@ tiny_ml/
 │   ├── normalization.py   #   LayerNorm, RMSNorm
 │   ├── embedding.py       #   Embedding + positional/feature variants
 │   ├── feedforward.py     #   FeedForward, SwiGLU (position-wise FFNs)
+│   ├── moe.py             #   MoEFeedForward (top-k routed mixture of experts)
 │   ├── residual.py        #   ResidualBlock
 │   └── attention.py       #   MultiHeadAttention, TransformerBlock, T5/cross attention
 ├── models/                # full models composed from layers
@@ -116,7 +123,7 @@ tiny_ml/
 ├── losses/                # MSELoss, SoftmaxCrossEntropy, BinaryCrossEntropy
 ├── optim/                 # SGD, Momentum, ADAM
 ├── metrics/               # precision, recall, f1_score, accuracy
-├── training/              # Trainer (fit / predict / evaluate loop)
+├── training/              # Trainer (fit / predict / evaluate loop), checkpoint utils
 └── examples/              # one runnable script per model
 ```
 
@@ -152,6 +159,59 @@ GPU/TPU. `generate()` uses a **static KV cache** (preallocated at `max_seq_len`)
 shapes never change between decode steps — without it, XLA would recompile every op for
 every new sequence length, which made generation ~50x slower. Small models still decode
 somewhat faster on numpy, since eager JAX pays per-op dispatch overhead on every step.
+
+## Benchmarks: 100M-scale training
+
+Two byte-level language models (vocab = 256) trained on this repo's own source code
+(~136 KB of Python + Markdown) with `examples/train_100m.py` and
+`examples/train_100m_moe.py`. Setup: seq len 128, batch 8, ADAM lr 3e-4, 150 steps,
+JAX float32 backend, Apple M3 Max (CPU). The MoE model swaps each block's dense FFN
+for a 4-expert top-2 `MoEFeedForward` and halves the layer count — more *total*
+parameters than the dense model, fewer *active* per token. (Note the MoE
+implementation is dense-compute, so step time does not benefit from the sparsity;
+see the design note in `layers/moe.py`.)
+
+| model | config | params (total) | params (active/token) | step time | loss step 1 → 150 | final ppl |
+|---|---|--:|--:|--:|--|--:|
+| dense GPT-2 | d768, 12h, 16L | 113,800,704 | 113,800,704 | 1.35 s | 5.85 → 2.79 | 16.3 |
+| MoE GPT-2 | d768, 12h, 8L, 4e top-2 | 170,460,704 | 94,901,792 | 1.68 s | 5.69 → 2.65 | 14.1 |
+
+150 steps ≈ 150K tokens seen — enough for loss to fall well below the uniform-random
+5.55 and for samples to pick up code-shaped structure (indentation, `self`, call
+syntax), not enough for real code. Both scripts accept `TRAIN_STEPS=` to go longer.
+One instructive artifact of the MoE run: with no load-balancing auxiliary loss, most
+blocks collapse onto one or two dominant experts (per-block gate mass like
+0.98/0.01/0.00/0.00) — exactly the failure mode the aux losses in production MoEs
+(Switch, Mixtral) exist to prevent.
+
+### Parameter breakdown
+
+Both models share the embedding/attention skeleton; they differ only in FFN and depth.
+The output head is weight-tied to the token embedding, so it contributes no parameters.
+
+| component | dense (16 layers) | MoE (8 layers) |
+|---|--:|--:|
+| token embedding (tied output head) | 196,608 | 196,608 |
+| learned positional embedding | 196,608 | 196,608 |
+| attention Q/K/V/O — per block | 2,362,368 | 2,362,368 |
+| FFN — per block | 4,722,432 | 18,892,804 = router 3,076 + 4 × 4,722,432 |
+| 2 LayerNorms — per block | 3,072 | 3,072 |
+| block total × depth | 7,087,872 × 16 | 21,258,244 × 8 |
+| final LayerNorm | 1,536 | 1,536 |
+| **total** | **113,800,704** | **170,460,704** |
+
+### Training-time array accounting
+
+Every `Parameter` carries its weights (used in forward) and a same-shaped `.grad`
+(written in backward); ADAM keeps two moment arrays per parameter. Training memory is
+therefore 4× the model size, plus activations; inference needs only the weights.
+
+| array set | role | count | dense | MoE |
+|---|---|--:|--:|--:|
+| `p.data` | forward (weights) | 1× params | 113.8M | 170.5M |
+| `p.grad` | backward (gradients) | 1× params | 113.8M | 170.5M |
+| ADAM `m`, `v` | optimizer (moments) | 2× params | 227.6M | 340.9M |
+| **total training floats** | | **4× params** | **455.2M (~1.8 GB @ fp32)** | **681.8M (~2.7 GB @ fp32)** |
 
 ## Dependencies
 
